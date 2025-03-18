@@ -1,0 +1,15 @@
+{
+    "name": "log-processor",
+    "version": "1.0.0",
+    "description": "Микросервис для обработки логов Solana",
+    "main": "index.js",
+    "scripts": {
+      "start": "node index.js"
+    },
+    "dependencies": {
+      "dotenv": "^16.0.3",
+      "redis": "^4.6.7",
+      "winston": "^3.8.2"
+    }
+  }
+  

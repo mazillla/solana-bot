@@ -1,0 +1,34 @@
+version: '3'
+services:
+  redis:
+    image: redis:latest
+    restart: always
+    ports:
+      - "6379:6379"
+
+  solana_subscriber:
+    build: ./services/solana_subscriber
+    restart: always
+    environment:
+      - RPC_HTTP_URL=${RPC_HTTP_URL}
+      - RPC_WS_URL=${RPC_WS_URL}
+    depends_on:
+      - redis
+
+  account_manager:
+    build: ./services/account_manager
+    restart: always
+    depends_on:
+      - redis
+
+  log_processor:
+    build: ./services/log_processor
+    restart: always
+    depends_on:
+      - redis
+
+  redis_buffer:
+    build: ./utils/redis_buffer
+    restart: always
+    depends_on:
+      - redis

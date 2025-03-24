@@ -1,0 +1,44 @@
+# Node.js
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Logs
+logs/
+*.log
+*.log.*
+
+# dotenv files
+.env
+.env.*.local
+
+# OS
+.DS_Store
+Thumbs.db
+
+# VS Code
+.vscode/
+
+# Docker
+docker-compose.override.yml
+*.local.yml
+
+# Builds
+dist/
+build/
+
+# Coverage/test
+coverage/
+*.lcov
+
+# TypeScript cache
+*.tsbuildinfo
+
+# Misc
+*.tgz
+*.swp
+
+# Lockfiles from other managers (if only using npm)
+yarn.lock
+pnpm-lock.yaml

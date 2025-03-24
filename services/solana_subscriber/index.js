@@ -1,8 +1,7 @@
 import { Connection, PublicKey } from "@solana/web3.js";
 import { subscribeToLogs, unsubscribeFromLogs } from "./subscriptionManager.js";
 import { getMissedTransactions } from "./httpClient.js";
-import { sendToRedisBuffer } from "../utils/redis_buffer.js";
-import { logger } from "../utils/logger.js";
+import { logger } from "./utils/logger.js";
 import dotenv from "dotenv";
 
 dotenv.config();
@@ -54,7 +53,7 @@ function createConnection() {
 // 📌 **Добавляем подписку на все контрольные аккаунты**
 for (const account of CONTROL_ACCOUNTS) {
     connection.onLogs(
-        { mentions: new PublicKey(account) },
+        new PublicKey(account),
         (logInfo) => {
             logger.info(`[✅] Контрольный аккаунт ${account} получил транзакцию: ${logInfo.signature}`);
             lastControlActivity = Date.now(); // Обнуляем таймер "тишины"

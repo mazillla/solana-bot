@@ -1,10 +1,9 @@
 import { createClient } from "redis";
-import { sendToRedisBuffer } from "../utils/redis_buffer.js";
 import dotenv from "dotenv";
 
 dotenv.config();
 
-const redisClient = createClient();
+const redisClient = createClient({ url: "redis://redis:6379" });
 await redisClient.connect();
 
 // 📌 **Глобальный перехват ошибок, чтобы процесс не падал**

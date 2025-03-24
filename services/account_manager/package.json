@@ -1,6 +1,7 @@
 {
     "name": "account-manager",
     "version": "1.0.0",
+    "type": "module",
     "description": "Микросервис для управления подписками",
     "main": "index.js",
     "scripts": {

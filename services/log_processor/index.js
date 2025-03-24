@@ -1,6 +1,5 @@
 import { createClient } from "redis";
 import { logger } from "../utils/logger.js";
-import { sendToRedisBuffer } from "../utils/redis_buffer.js";
 import dotenv from "dotenv";
 
 dotenv.config();

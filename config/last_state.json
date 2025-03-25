@@ -6,8 +6,7 @@
     "CONTROL_ACCOUNTS": [
       "AC5RDfQFmDS1deWZos921JfqscXdByf8BKHs5ACWjtW2",
       "9n4nbM75f5Ui33ZbPYXn59EwSgE8CGsHtAeTH5YFeJ9E",
-      "4Nd1mXgU6ZKwdc9Lu5UtFALF2zixJgsHYXAvnppcHrQn",
-      "test"
+      "4Nd1mXgU6ZKwdc9Lu5UtFALF2zixJgsHYXAvnppcHrQn"
     ]
   },
   "redis": {

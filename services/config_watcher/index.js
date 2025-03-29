@@ -1,5 +1,5 @@
 import { checkConfigChangesAndPublish } from './watcher.js';
-import { logger } from '../../utils/logger.js';
+import  logger  from '../../utils/logger.js';
 
 logger.info('[config_watcher] Интервальное слежение за config.json запущено (каждые 10 сек)');
 

@@ -1,0 +1,208 @@
+version: '3.8'
+
+services:
+  redis:
+    image: redis:latest
+    container_name: redis
+    restart: always
+    ports:
+      - "6379:6379"
+    networks:
+      - bot_network
+
+  postgres:
+    image: postgres:15
+    container_name: postgres
+    restart: always
+    environment:
+      POSTGRES_USER: solana
+      POSTGRES_PASSWORD: solana
+      POSTGRES_DB: solana_bot
+    volumes:
+      - ./database/init.sql:/docker-entrypoint-initdb.d/init.sql
+      - pg_data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    networks:
+      - bot_network
+
+  pgadmin:
+    image: dpage/pgadmin4
+    container_name: pgadmin
+    restart: always
+    environment:
+      PGADMIN_DEFAULT_EMAIL: admin@admin.com
+      PGADMIN_DEFAULT_PASSWORD: admin
+    ports:
+      - "8080:80"
+    depends_on:
+      - postgres
+    networks:
+      - bot_network
+
+  # solana_subscriber:
+  #   build: ./services/solana_subscriber
+  #   container_name: solana_subscriber
+  #   restart: always
+  #   env_file:
+  #     - ./config/.env
+  #   volumes:
+  #     - ./utils:/app/utils
+  #   depends_on:
+  #     - redis
+  #     - postgres
+  #   networks:
+  #     - bot_network
+  #   healthcheck:
+  #     test: ["CMD", "node", "-e", "console.log('Healthcheck OK')"]
+  #     interval: 10s
+  #     timeout: 5s
+  #     retries: 5
+
+  # account_manager:
+  #   build: ./services/account_manager
+  #   container_name: account_manager
+  #   restart: always
+  #   env_file:
+  #     - ./config/.env
+  #   environment:
+  #     - REDIS_HOST=redis
+  #     - REDIS_PORT=6379
+  #     - DB_HOST=postgres
+  #     - DB_PORT=5432
+  #     - DB_USER=solana
+  #     - DB_PASSWORD=solana
+  #     - DB_NAME=solana_bot
+  #   depends_on:
+  #     - redis
+  #     - postgres
+  #     - solana_subscriber
+  #   networks:
+  #     - bot_network
+  #   healthcheck:
+  #     test: ["CMD", "node", "-e", "console.log('Healthcheck OK')"]
+  #     interval: 10s
+  #     timeout: 5s
+  #     retries: 5
+
+  # log_processor:
+  #   build: ./services/log_processor
+  #   container_name: log_processor
+  #   restart: always
+  #   env_file:
+  #     - ./config/.env
+  #   environment:
+  #     - REDIS_HOST=redis
+  #     - REDIS_PORT=6379
+  #     - DB_HOST=postgres
+  #     - DB_PORT=5432
+  #     - DB_USER=solana
+  #     - DB_PASSWORD=solana
+  #     - DB_NAME=solana_bot
+  #   depends_on:
+  #     - redis
+  #     - postgres
+  #     - solana_subscriber
+  #     - account_manager
+  #   networks:
+  #     - bot_network
+
+  config_server:
+    build:
+      context: .
+      dockerfile: services/config_server/Dockerfile
+    container_name: config_server
+    restart: always
+    ports:
+      - "3001:3001"
+    working_dir: /app/services/config_server
+    volumes:
+      - .:/app
+    depends_on:
+      - redis
+      - postgres
+    environment:
+      - NODE_ENV=production
+
+  config_watcher:
+    build:
+      context: .
+      dockerfile: services/config_watcher/Dockerfile
+    container_name: config_watcher
+    restart: always
+    working_dir: /app/services/config_server
+    volumes:
+      - .:/app
+    depends_on:
+      - redis
+    networks:
+      - bot_network
+
+
+  opensearch:
+    image: opensearchproject/opensearch:2.13.0
+    container_name: opensearch
+    environment:
+      - discovery.type=single-node
+      - plugins.security.disabled=true
+      - bootstrap.memory_lock=true
+      - OPENSEARCH_JAVA_OPTS=-Xms512m -Xmx512m
+      - OPENSEARCH_INITIAL_ADMIN_PASSWORD=4e4et04kA!+QhyD
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+    ports:
+      - "9200:9200"
+      - "9600:9600"
+    volumes:
+      - opensearch-data:/usr/share/opensearch/data
+    networks:
+      - bot_network
+
+  grafana:
+    image: grafana/grafana:latest
+    container_name: grafana
+    depends_on:
+      - opensearch
+    ports:
+      - "3002:3000"
+    environment:
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+    networks:
+      - bot_network
+
+  fluent-bit:
+    image: fluent/fluent-bit:3.0.4
+    container_name: fluent-bit
+    depends_on:
+      - opensearch
+    volumes:
+      - ./services/logging/fluent-bit/fluent-bit.conf:/fluent-bit/etc/fluent-bit.conf
+      - ./services/logging/fluent-bit/parsers.conf:/fluent-bit/etc/parsers.conf
+      - ./logs:/logs:ro
+    command: ["/fluent-bit/bin/fluent-bit", "-c", "/fluent-bit/etc/fluent-bit.conf"]
+    networks:
+      - bot_network
+
+  ui:
+    build:
+      context: ./ui
+    container_name: ui
+    ports:
+      - "3000:3000"
+    environment:
+      - PORT=3000
+    depends_on:
+      - config_server
+    networks:
+      - bot_network
+
+networks:
+  bot_network:
+    driver: bridge
+
+volumes:
+  pg_data:
+  opensearch-data:

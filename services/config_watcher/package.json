@@ -1,0 +1,14 @@
+{
+    "name": "config_watcher",
+    "version": "1.0.0",
+    "description": "Service that watches config.json and publishes changes to Redis Stream",
+    "main": "index.js",
+    "type": "module",
+    "scripts": {
+      "start": "node index.js"
+    },
+    "dependencies": {
+      "redis": "^4.6.7"
+    }
+  }
+  

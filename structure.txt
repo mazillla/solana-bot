@@ -1,0 +1,78 @@
+.
+├── README.md
+├── config
+│   ├── config.json
+│   └── last_state.json
+├── database
+│   └── db_connection.js
+├── docker
+│   └── docker-compose.yml
+├── logs
+│   └── test.log
+├── package-lock.json
+├── package.json
+├── scripts
+│   └── subscribe.js
+├── services
+│   ├── account_manager
+│   │   ├── Dockerfile
+│   │   ├── accountLogic.js
+│   │   ├── index.js
+│   │   ├── package-lock.json
+│   │   └── package.json
+│   ├── config_server
+│   │   ├── Dockerfile
+│   │   ├── index.js
+│   │   ├── package-lock.json
+│   │   ├── package.json
+│   │   └── routes
+│   │       └── config.js
+│   ├── config_watcher
+│   │   ├── index.js
+│   │   └── watcher.js
+│   ├── log_processor
+│   │   ├── Dockerfile
+│   │   ├── index.js
+│   │   ├── package.json
+│   │   └── tradeHandler.js
+│   ├── logging
+│   │   ├── docker-compose.yml
+│   │   └── fluent-bit
+│   │       ├── fluent-bit.conf
+│   │       └── parsers.conf
+│   └── solana_subscriber
+│       ├── Dockerfile
+│       ├── config.js
+│       ├── httpClient.js
+│       ├── index.js
+│       ├── package-lock.json
+│       ├── package.json
+│       └── subscriptionManager.js
+├── structure.txt
+├── tests
+│   ├── consumer.js
+│   └── producer.js
+├── ui
+│   ├── Dockerfile
+│   ├── package-lock.json
+│   ├── package.json
+│   ├── public
+│   │   └── index.html
+│   └── src
+│       ├── App.jsx
+│       ├── components
+│       │   ├── ConfigEditor.jsx
+│       │   ├── Navigation.jsx
+│       │   ├── ServiceStatusPanel.jsx
+│       │   └── StreamLogViewer.jsx
+│       └── index.js
+└── utils
+    ├── configApplier.js
+    ├── configManager.js
+    ├── eventBus.js
+    ├── eventSchemas.js
+    ├── logger.js
+    ├── redisClient.js
+    └── redis_buffer.js
+
+21 directories, 55 files

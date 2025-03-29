@@ -6,7 +6,7 @@ WORKDIR /app
 COPY ../../ ./
 
 # Переходим в директорию сервиса
-WORKDIR /app/services/config_server
+WORKDIR /app/services/config_watcher
 
 RUN npm install
 

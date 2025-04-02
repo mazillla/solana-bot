@@ -4,8 +4,10 @@ export const ConfigEditor = () => {
   const [configText, setConfigText] = useState('');
   const [status, setStatus] = useState(null);
 
+  const API_BASE = `${window.location.protocol}//${window.location.hostname}:3001`;
+
   useEffect(() => {
-    fetch('/config')
+    fetch(`${API_BASE}/config`)
       .then((res) => res.json())
       .then((data) => setConfigText(JSON.stringify(data, null, 2)))
       .catch(() => setStatus('❌ Ошибка при загрузке'));
@@ -14,7 +16,7 @@ export const ConfigEditor = () => {
   const handleSave = async () => {
     try {
       const parsed = JSON.parse(configText);
-      const res = await fetch('/config', {
+      const res = await fetch(`${API_BASE}/config`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(parsed),

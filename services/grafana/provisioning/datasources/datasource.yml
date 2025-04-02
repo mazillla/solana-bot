@@ -1,0 +1,13 @@
+# services/grafana/provisioning/datasources/datasource.yml
+apiVersion: 1
+
+datasources:
+  - name: OpenSearch
+    type: opensearch
+    access: proxy
+    url: http://opensearch:9200
+    isDefault: true
+    database: solana-logs*
+    jsonData:
+      timeField: "@timestamp"
+      version: "2.13.0"

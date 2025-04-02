@@ -1,0 +1,7 @@
+# Вывести список запущенных контейнеров
+docker ps
+
+# запуск core
+docker compose -f docker/docker-compose.core.yml up -d 
+
+

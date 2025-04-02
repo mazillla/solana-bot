@@ -1,0 +1,9 @@
+# services/grafana/provisioning/dashboards/dashboards.yml
+apiVersion: 1
+
+providers:
+  - name: 'default'
+    folder: 'Solana Logs'
+    type: file
+    options:
+      path: /etc/grafana/dashboards

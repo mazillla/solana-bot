@@ -1,24 +1,17 @@
-// producer.js
-import Redis from "ioredis";
+// tests/producer.js
+import { createClient } from 'redis';
 
-const redis = new Redis({
-  host: "localhost",
-  port: 6379,
+const redis = createClient();
+await redis.connect();
+
+await redis.xAdd('logs:stream', '*', {
+  data: JSON.stringify({
+    service: 'test',
+    level: 'info',
+    timestamp: new Date().toISOString(),
+    message: 'Привет из Redis!',
+  }),
 });
 
-const streamKey = "solanaStream";
-
-async function sendMessage() {
-  const message = {
-    token: "So11111111111111111111111111111111111111112",
-    signature: "sample_signature_" + Date.now(),
-    timestamp: Date.now().toString(),
-  };
-
-  const id = await redis.xadd(streamKey, "*", ...Object.entries(message).flat());
-
-  console.log(`✅ Сообщение отправлено в стрим с ID: ${id}`);
-  process.exit(0);
-}
-
-sendMessage();
+console.log('Лог отправлен');
+await redis.quit();

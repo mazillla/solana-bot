@@ -1,0 +1,15 @@
+services:
+  log_writer_service:
+    build:
+      context: ../services/logging
+      dockerfile: Dockerfile
+    container_name: log_writer_service
+    volumes:
+      - ../logs:/app/logs
+    networks:
+      - bot_network
+
+networks:
+  bot_network:
+    external: true
+    name: docker_bot_network

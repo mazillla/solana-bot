@@ -1,0 +1,68 @@
+{
+    "id": null,
+    "uid": "solana-logs-dashboard",
+    "title": "Solana Logs",
+    "tags": ["logs"],
+    "timezone": "browser",
+    "schemaVersion": 38,
+    "version": 1,
+    "refresh": "5s",
+    "panels": [
+      {
+        "type": "logs",
+        "title": "Log Stream",
+        "gridPos": { "x": 0, "y": 0, "w": 24, "h": 15 },
+        "datasource": "OpenSearch",
+        "targets": [
+          {
+            "refId": "A",
+            "query": "*",
+            "datasource": { "type": "opensearch", "uid": "-" }
+          }
+        ],
+        "options": {
+          "showTime": true,
+          "wrapLogMessage": true,
+          "showLabels": true,
+          "dedupStrategy": "none"
+        }
+      },
+      {
+        "type": "timeseries",
+        "title": "Log Count Over Time",
+        "gridPos": { "x": 0, "y": 15, "w": 24, "h": 10 },
+        "datasource": "OpenSearch",
+        "fieldConfig": {
+          "defaults": {
+            "custom": {}
+          },
+          "overrides": []
+        },
+        "targets": [
+          {
+            "refId": "A",
+            "bucketAggs": [
+              {
+                "id": "1",
+                "type": "date_histogram",
+                "field": "@timestamp",
+                "settings": {
+                  "interval": "auto",
+                  "min_doc_count": 0
+                }
+              }
+            ],
+            "metrics": [
+              {
+                "id": "1",
+                "type": "count"
+              }
+            ],
+            "query": "*",
+            "datasource": { "type": "opensearch", "uid": "-" }
+          }
+        ]
+      }
+    ]
+  }
+  

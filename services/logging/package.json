@@ -1,0 +1,13 @@
+{
+    "name": "log-writer-service",
+    "version": "1.0.0",
+    "type": "module",
+    "main": "log_writer_service.js",
+    "scripts": {
+      "start": "node log_writer_service.js"
+    },
+    "dependencies": {
+      "redis": "^4.6.7"
+    }
+  }
+  

@@ -1,14 +1,12 @@
-version: '3.8'
-
 services:
   redis:
-    image: redis:latest
+    image: redis:7
     container_name: redis
     restart: always
     ports:
       - "6379:6379"
     volumes:
-      - redis-data:/data                      # 💾 сохраняем Redis
+      - redis-data:/data
     networks:
       - bot_network
 
@@ -21,7 +19,7 @@ services:
       POSTGRES_PASSWORD: solana
       POSTGRES_DB: solana_bot
     volumes:
-      - ./database/init.sql:/docker-entrypoint-initdb.d/init.sql
+      - ../database/init.sql:/docker-entrypoint-initdb.d/init.sql
       - pg_data:/var/lib/postgresql/data
     ports:
       - "5432:5432"
@@ -42,37 +40,6 @@ services:
     networks:
       - bot_network
 
-  config_server:
-    build:
-      context: .
-      dockerfile: services/config_server/Dockerfile
-    container_name: config_server
-    restart: always
-    ports:
-      - "3001:3001"
-    working_dir: /app/services/config_server
-    volumes:
-      - .:/app
-    depends_on:
-      - redis
-      - postgres
-    environment:
-      - NODE_ENV=production
-
-  config_watcher:
-    build:
-      context: .
-      dockerfile: services/config_watcher/Dockerfile
-    container_name: config_watcher
-    restart: always
-    working_dir: /app/services/config_watcher
-    volumes:
-      - .:/app
-    depends_on:
-      - redis
-    networks:
-      - bot_network
-
   opensearch:
     image: opensearchproject/opensearch:2.13.0
     container_name: opensearch
@@ -86,11 +53,11 @@ services:
       memlock:
         soft: -1
         hard: -1
+    volumes:
+      - opensearch-data:/usr/share/opensearch/data
     ports:
       - "9200:9200"
       - "9600:9600"
-    volumes:
-      - opensearch-data:/usr/share/opensearch/data
     networks:
       - bot_network
 
@@ -104,6 +71,11 @@ services:
     environment:
       - GF_SECURITY_ADMIN_USER=admin
       - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_LIVE_ENABLED=false            # <--- отключает live-функции
+    volumes:
+      - ./services/grafana/provisioning/datasources:/etc/grafana/provisioning/datasources
+      - ./services/grafana/provisioning/dashboards:/etc/grafana/provisioning/dashboards
+      - ./services/grafana/dashboards:/etc/grafana/dashboards
     networks:
       - bot_network
 
@@ -113,24 +85,11 @@ services:
     depends_on:
       - opensearch
     volumes:
-      - ./services/logging/fluent-bit/fluent-bit.conf:/fluent-bit/etc/fluent-bit.conf
-      - ./services/logging/fluent-bit/parsers.conf:/fluent-bit/etc/parsers.conf
-      - ./logs:/logs:ro
-      - fluentbit-buffer:/fluent-bit/buffer                    # 💾 сохраняем позиции логов
+      - ../services/fluent-bit/fluent-bit.conf:/fluent-bit/etc/fluent-bit.conf
+      - ../services/fluent-bit/parsers.conf:/fluent-bit/etc/parsers.conf
+      - ../logs:/logs:ro
+      - fluentbit-buffer:/fluent-bit/buffer
     command: ["/fluent-bit/bin/fluent-bit", "-c", "/fluent-bit/etc/fluent-bit.conf"]
-    networks:
-      - bot_network
-
-  ui:
-    build:
-      context: ./ui
-    container_name: ui
-    ports:
-      - "3000:3000"
-    environment:
-      - PORT=3000
-    depends_on:
-      - config_server
     networks:
       - bot_network
 
@@ -139,7 +98,11 @@ networks:
     driver: bridge
 
 volumes:
+  redis-data:
+    external: true
   pg_data:
+    external: true
   opensearch-data:
-  redis-data:                # 💾 Redis сохраняется
-  fluentbit-buffer:          # 💾 Буфер для Fluent Bit
+    external: true
+  fluentbit-buffer:
+    external: true

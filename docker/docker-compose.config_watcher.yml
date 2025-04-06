@@ -1,0 +1,15 @@
+services:
+  config_watcher:
+      build:
+        context: ../
+        dockerfile: services/config_watcher/Dockerfile
+      volumes:
+        - ../config:/app/config
+      restart: always
+      networks:
+      - bot_network
+
+networks:
+  bot_network:
+    external: true
+    name: docker_bot_network

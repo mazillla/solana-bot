@@ -1,17 +1,9 @@
 FROM node:20
 
-# Рабочая директория в контейнере
 WORKDIR /app
 
-# Копируем только package.json и lock
-COPY ./services/config_server/package*.json ./services/config_server/
+COPY . .
 
-# Устанавливаем зависимости
-WORKDIR /app/services/config_server
-RUN npm install
+RUN npm install --prefix services/config_server
 
-# Копируем исходники сервиса
-COPY ./services/config_server ./services/config_server
-
-# Команда запуска
-CMD ["node", "index.js"]
+CMD ["node", "services/config_server/index.js"]

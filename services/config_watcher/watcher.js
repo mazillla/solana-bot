@@ -3,7 +3,7 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 import { validateEvent } from '../../utils/eventSchemas.js';
 import { redisClient } from '../../utils/redisClient.js';
-import  logger  from '../../utils/logger.js';
+import { sharedLogger } from '../../utils/sharedLogger.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -20,13 +20,20 @@ export async function checkConfigChangesAndPublish() {
       : null;
 
     if (JSON.stringify(config) === JSON.stringify(lastState)) {
-      logger.info('[watcher] Конфиг не изменился.');
+      await sharedLogger({
+        service: 'config_watcher',
+        level: 'info',
+        message: 'Конфиг не изменился.'
+      });
       return;
     }
 
-    logger.info('[watcher] Обнаружены изменения в config.json');
+    await sharedLogger({
+      service: 'config_watcher',
+      level: 'info',
+      message: 'Обнаружены изменения в config.json'
+    });
 
-    // Формируем payload по схеме
     const payload = {
       target: 'config.json',
       changed: config
@@ -34,11 +41,14 @@ export async function checkConfigChangesAndPublish() {
 
     const { valid, missingFields } = validateEvent('CONFIG_UPDATE', payload);
     if (!valid) {
-      logger.error('[watcher] Ошибка валидации схемы:', missingFields);
+      await sharedLogger({
+        service: 'config_watcher',
+        level: 'error',
+        message: `Ошибка валидации схемы: ${missingFields.join(', ')}`
+      });
       return;
     }
 
-    // Отправка в Redis Stream
     await redisClient.xadd(
       REDIS_STREAM_KEY,
       '*',
@@ -49,13 +59,25 @@ export async function checkConfigChangesAndPublish() {
       })
     );
 
-    logger.info('[watcher] Конфигурация отправлена в Redis Stream');
+    await sharedLogger({
+      service: 'config_watcher',
+      level: 'info',
+      message: 'Конфигурация отправлена в Redis Stream'
+    });
 
-    // Сохраняем новое состояние
     fs.writeFileSync(statePath, JSON.stringify(config, null, 2));
-    logger.info('[watcher] last_state.json обновлён');
+
+    await sharedLogger({
+      service: 'config_watcher',
+      level: 'info',
+      message: 'last_state.json обновлён'
+    });
 
   } catch (err) {
-    logger.error('[watcher] Ошибка при сравнении или отправке:', err);
+    await sharedLogger({
+      service: 'config_watcher',
+      level: 'error',
+      message: `Ошибка при сравнении или отправке: ${err.message}`
+    });
   }
 }

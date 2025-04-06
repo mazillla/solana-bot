@@ -1,0 +1,16 @@
+services:
+  ui:
+    build:
+      context: ../ui
+      dockerfile: Dockerfile
+    container_name: ui
+    ports:
+      - "3000:3000"
+    restart: unless-stopped
+    networks:
+      - bot_network
+
+networks:
+  bot_network:
+    external: true
+    name: docker_bot_network

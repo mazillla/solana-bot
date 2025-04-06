@@ -42,3 +42,5 @@ coverage/
 # Lockfiles from other managers (if only using npm)
 yarn.lock
 pnpm-lock.yaml
+
+docker/start.txt

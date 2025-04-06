@@ -1,0 +1,17 @@
+services:
+  config_server:
+    build:
+      context: ../
+      dockerfile: services/config_server/Dockerfile
+    ports:
+      - "3001:3001"
+    volumes:
+      - ../config:/app/config
+    restart: always
+    networks:
+      - bot_network
+
+networks:
+  bot_network:
+    external: true
+    name: docker_bot_network

@@ -57,3 +57,26 @@ CREATE TABLE token_accounts (
     first_seen TIMESTAMP DEFAULT NOW(),
     notes TEXT
 );
+
+-- subscriber_config: глобальная конфигурация подписчика
+CREATE TABLE IF NOT EXISTS subscriber_config (
+    id SERIAL PRIMARY KEY,
+    rpc_endpoints JSONB NOT NULL,
+    control_accounts TEXT[] NOT NULL,
+    silence_threshold_ms INTEGER NOT NULL DEFAULT 60000,
+    queue_max_length INTEGER NOT NULL DEFAULT 1000,
+    rpc_timeout_ms INTEGER NOT NULL DEFAULT 5000,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- subscriptions: активные подписки на аккаунты
+CREATE TABLE IF NOT EXISTS subscriptions (
+    chain_id TEXT NOT NULL,
+    account TEXT NOT NULL,
+    subscription_type TEXT NOT NULL CHECK (subscription_type IN ('regular', 'spl_token')),
+    active BOOLEAN DEFAULT TRUE,
+    last_signature TEXT,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (chain_id, account)
+);

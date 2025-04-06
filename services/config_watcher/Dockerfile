@@ -2,12 +2,8 @@ FROM node:20
 
 WORKDIR /app
 
-# Копируем весь проект
 COPY . .
 
-# Переходим в директорию сервиса
-WORKDIR /app/services/config_watcher
+RUN npm install --prefix services/config_watcher
 
-RUN npm install
-
-CMD ["node", "index.js"]
+CMD ["node", "services/config_watcher/index.js"]

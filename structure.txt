@@ -8,12 +8,23 @@
 ├── database
 │   └── init.sql
 ├── docker
+│   ├── docker-compose.config_server.yml
+│   ├── docker-compose.config_watcher.yml
 │   ├── docker-compose.core.yml
 │   ├── docker-compose.log_writer.yml
+│   ├── docker-compose.ui.yml
+│   ├── services
+│   │   └── grafana
+│   │       ├── dashboards
+│   │       └── provisioning
+│   │           ├── dashboards
+│   │           └── datasources
 │   └── start.txt
 ├── docker-compose.full.yml
+├── get_IP.txt
 ├── logs
 │   ├── config_server.log
+│   ├── config_watcher.log
 │   └── test.log
 ├── node_modules
 ├── package-lock.json
@@ -39,6 +50,14 @@
 │   ├── fluent-bit
 │   │   ├── fluent-bit.conf
 │   │   └── parsers.conf
+│   ├── grafana
+│   │   ├── dashboards
+│   │   │   └── solana-logs-dashboard.json
+│   │   └── provisioning
+│   │       ├── dashboards
+│   │       │   └── dashboards.yml
+│   │       └── datasources
+│   │           └── datasource.yml
 │   ├── log_processor
 │   │   ├── Dockerfile
 │   │   ├── index.js
@@ -59,7 +78,9 @@
 ├── structure.txt
 ├── tests
 │   ├── consumer.js
-│   └── producer.js
+│   ├── package.json
+│   ├── producer.js
+│   └── sharedlogger_test.js
 ├── ui
 │   ├── Dockerfile
 │   ├── package-lock.json

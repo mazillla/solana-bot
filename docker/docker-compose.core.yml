@@ -73,9 +73,9 @@ services:
       - GF_SECURITY_ADMIN_PASSWORD=admin
       - GF_LIVE_ENABLED=false            # <--- отключает live-функции
     volumes:
-      - ./services/grafana/provisioning/datasources:/etc/grafana/provisioning/datasources
-      - ./services/grafana/provisioning/dashboards:/etc/grafana/provisioning/dashboards
-      - ./services/grafana/dashboards:/etc/grafana/dashboards
+      - ../services/grafana/provisioning/datasources:/etc/grafana/provisioning/datasources
+      - ../services/grafana/provisioning/dashboards:/etc/grafana/provisioning/dashboards
+      - ../services/grafana/dashboards:/etc/grafana/dashboards
     networks:
       - bot_network
 
@@ -93,6 +93,20 @@ services:
     networks:
       - bot_network
 
+  redisinsight:
+    image: redis/redisinsight:latest
+    container_name: redisinsight
+    ports:
+      - "5540:5540" 
+    networks:
+      - bot_network
+    volumes:
+      - redisinsight-data:/data
+    restart: unless-stopped
+    depends_on:
+      - redis
+
+
 networks:
   bot_network:
     driver: bridge
@@ -105,4 +119,6 @@ volumes:
   opensearch-data:
     external: true
   fluentbit-buffer:
+    external: true
+  redisinsight-data:
     external: true

@@ -1,9 +1,9 @@
 import Fastify from 'fastify';
 import cors from '@fastify/cors';
 import configRoutes from './routes/config.js';
-import logger from '../../utils/logger.js';
+import { sharedLogger } from '../../utils/sharedLogger.js'; // 👈 импорт нового логгера
 
-const SERVICE_NAME = 'config_server'; // 👈 явно задаем имя
+const SERVICE_NAME = 'config_server';
 
 const fastify = Fastify({ logger: false });
 
@@ -12,10 +12,19 @@ await fastify.register(configRoutes);
 
 const PORT = process.env.PORT || 3001;
 
-fastify.listen({ port: PORT, host: '0.0.0.0' }, (err, address) => {
+fastify.listen({ port: PORT, host: '0.0.0.0' }, async (err, address) => {
   if (err) {
-    logger.error(SERVICE_NAME, 'Ошибка запуска сервера', { error: err.message });
+    await sharedLogger({
+      service: SERVICE_NAME,
+      level: 'error',
+      message: `Ошибка запуска сервера: ${err.message}`,
+    });
     process.exit(1);
   }
-  logger.info(SERVICE_NAME, `🚀 Config Server listening on ${address}`);
+
+  await sharedLogger({
+    service: SERVICE_NAME,
+    level: 'info',
+    message: `🚀 Config Server listening on ${address}`,
+  });
 });

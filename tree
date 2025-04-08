@@ -1,101 +1,96 @@
-├── .git
+/home/mazillla/solana-bot/
 ├── .gitignore
 ├── README.md
-├── config
+├── config/
 │   ├── .env
 │   ├── config.json
 │   └── last_state.json
-├── database
+├── database/
 │   └── init.sql
-├── docker
+├── docker/
 │   ├── docker-compose.config_server.yml
 │   ├── docker-compose.config_watcher.yml
 │   ├── docker-compose.core.yml
 │   ├── docker-compose.log_writer.yml
-│   ├── docker-compose.ui.yml
-│   ├── services
-│   │   └── grafana
-│   │       ├── dashboards
-│   │       └── provisioning
-│   │           ├── dashboards
-│   │           └── datasources
-│   └── start.txt
+│   └── docker-compose.ui.yml
 ├── docker-compose.full.yml
+├── docker_cheatsheet.md
 ├── get_IP.txt
-├── logs
-│   ├── config_server.log
-│   ├── config_watcher.log
-│   └── test.log
-├── node_modules
-├── package-lock.json
-├── package.json
-├── services
-│   ├── account_manager
-│   │   ├── Dockerfile
-│   │   ├── accountLogic.js
-│   │   ├── index.js
-│   │   ├── package-lock.json
-│   │   └── package.json
-│   ├── config_server
-│   │   ├── Dockerfile
-│   │   ├── index.js
-│   │   ├── package.json
-│   │   └── routes
-│   │       └── config.js
-│   ├── config_watcher
-│   │   ├── Dockerfile
-│   │   ├── index.js
-│   │   ├── package.json
-│   │   └── watcher.js
-│   ├── fluent-bit
-│   │   ├── fluent-bit.conf
-│   │   └── parsers.conf
-│   ├── grafana
-│   │   ├── dashboards
-│   │   │   └── solana-logs-dashboard.json
-│   │   └── provisioning
-│   │       ├── dashboards
-│   │       │   └── dashboards.yml
-│   │       └── datasources
-│   │           └── datasource.yml
-│   ├── log_processor
-│   │   ├── Dockerfile
-│   │   ├── index.js
-│   │   ├── package.json
-│   │   └── tradeHandler.js
-│   ├── logging
-│   │   ├── Dockerfile
-│   │   ├── log_writer_service.js
-│   │   └── package.json
-│   └── solana_subscriber
+├─] logs/ (ignored)
+├── old/
+│   └── solana_subscriber_old/
 │       ├── Dockerfile
 │       ├── config.js
 │       ├── httpClient.js
 │       ├── index.js
 │       ├── package-lock.json
 │       ├── package.json
-│       └── subscriptionManager.js
-├── structure.txt
-├── tests
+│       ├── subscriptionManager.js
+│       └── ТЗ.txt
+├── package-lock.json
+├── package.json
+├── services/
+│   ├── config_server/
+│   │   ├── Dockerfile
+│   │   ├── index.js
+│   │   ├─] node_modules/ (ignored)
+│   │   ├── package-lock.json
+│   │   ├── package.json
+│   │   └── routes/
+│   │       └── config.js
+│   ├── config_watcher/
+│   │   ├── Dockerfile
+│   │   ├── index.js
+│   │   ├─] node_modules/ (ignored)
+│   │   ├── package-lock.json
+│   │   ├── package.json
+│   │   └── watcher.js
+│   ├── fluent-bit/
+│   │   ├── fluent-bit.conf
+│   │   └── parsers.conf
+│   ├── grafana/
+│   │   ├── dashboards/
+│   │   │   └── solana-logs-dashboard.json
+│   │   └── provisioning/
+│   │       ├── dashboards/
+│   │       │   └── dashboards.yml
+│   │       └── datasources/
+│   │           └── datasource.yml
+│   └── logging/
+│       ├── Dockerfile
+│       ├── log_writer_service.js
+│       ├─] node_modules/ (ignored)
+│       ├── package-lock.json
+│       └── package.json
+├── tests/
 │   ├── consumer.js
 │   ├── package.json
 │   ├── producer.js
 │   └── sharedlogger_test.js
-├── ui
+├── ui/
 │   ├── Dockerfile
+│   ├── build/
+│   │   ├── asset-manifest.json
+│   │   ├── index.html
+│   │   └── static/
+│   │       └── js/
+│   │           ├── main.262f7140.js
+│   │           ├── main.262f7140.js.LICENSE.txt
+│   │           └── main.262f7140.js.map
+│   ├─] node_modules/ (ignored)
 │   ├── package-lock.json
 │   ├── package.json
-│   ├── public
+│   ├── public/
 │   │   └── index.html
-│   └── src
+│   └── src/
 │       ├── App.jsx
-│       ├── components
+│       ├── components/
 │       │   ├── ConfigEditor.jsx
 │       │   ├── Navigation.jsx
 │       │   ├── ServiceStatusPanel.jsx
 │       │   └── StreamLogViewer.jsx
 │       └── index.js
-└── utils
+└── utils/
     ├── configApplier.js
     ├── configManager.js
     ├── eventBus.js

@@ -1,15 +1,15 @@
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
-import { validateEvent } from '../../utils/eventSchemas.js';
-import { redisClient } from '../../utils/redisClient.js';
-import { sharedLogger } from '../../utils/sharedLogger.js';
+import { validateEvent } from './utils/eventSchemas.js';
+import { redisClient } from './utils/redisClient.js';
+import { sharedLogger } from './utils/sharedLogger.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-const configPath = path.resolve(__dirname, '../../config/config.json');
-const statePath = path.resolve(__dirname, '../../config/last_state.json');
+const configPath = path.resolve(__dirname, './config/config.json');
+const statePath = path.resolve(__dirname, './config/last_state.json');
 const REDIS_STREAM_KEY = 'config:updates';
 
 export async function checkConfigChangesAndPublish() {

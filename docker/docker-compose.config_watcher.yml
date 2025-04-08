@@ -1,10 +1,11 @@
 services:
   config_watcher:
       build:
-        context: ../
-        dockerfile: services/config_watcher/Dockerfile
+        context: ../services/config_watcher
+        dockerfile: Dockerfile
       volumes:
         - ../config:/app/config
+        - ../utils:/app/utils
       restart: unless-stopped
       networks:
       - bot_network

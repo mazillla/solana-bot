@@ -1,5 +1,5 @@
 import { checkConfigChangesAndPublish } from './watcher.js';
-import { sharedLogger } from '../../utils/sharedLogger.js';
+import { sharedLogger } from './utils/sharedLogger.js';
 
 await sharedLogger({
   service: 'config_watcher',

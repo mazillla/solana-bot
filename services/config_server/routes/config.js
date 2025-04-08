@@ -1,11 +1,11 @@
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
-import { sharedLogger } from '../../../utils/sharedLogger.js'; // ✅ фикс пути
+import { sharedLogger } from '../utils/sharedLogger.js'; // ✅ фикс пути
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
-const configPath = path.resolve(__dirname, '../../../config/config.json');
+const configPath = path.resolve(__dirname, '../config/config.json');
 
 const SERVICE_NAME = 'config_server';
 

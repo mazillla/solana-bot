@@ -1,7 +1,7 @@
 import Fastify from 'fastify';
 import cors from '@fastify/cors';
 import configRoutes from './routes/config.js';
-import { sharedLogger } from '../../utils/sharedLogger.js'; // 👈 импорт нового логгера
+import { sharedLogger } from './utils/sharedLogger.js'; // 👈 импорт нового логгера
 
 const SERVICE_NAME = 'config_server';
 

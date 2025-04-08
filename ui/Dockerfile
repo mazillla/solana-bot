@@ -1,11 +1,7 @@
 FROM node:20
 
 WORKDIR /app
+
 COPY . .
 
-RUN npm install
-RUN npm run build
-
-# Установим простой сервер, например serve
-RUN npm install -g serve
-CMD ["serve", "-s", "build", "-l", "3000"]
+CMD ["sh", "-c", "chmod +x ./node_modules/.bin/serve && npx serve -s build -l 3000"]

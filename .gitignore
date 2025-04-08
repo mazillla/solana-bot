@@ -44,3 +44,6 @@ yarn.lock
 pnpm-lock.yaml
 
 docker/start.txt
+
+# Игнорировать все node_modules
+**/node_modules/

@@ -5,7 +5,7 @@ services:
         dockerfile: services/config_watcher/Dockerfile
       volumes:
         - ../config:/app/config
-      restart: always
+      restart: unless-stopped
       networks:
       - bot_network
 

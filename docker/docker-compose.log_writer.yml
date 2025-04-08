@@ -4,8 +4,11 @@ services:
       context: ../services/logging
       dockerfile: Dockerfile
     container_name: log_writer_service
+    restart: unless-stopped
     volumes:
       - ../logs:/app/logs
+      - ../services/logging:/app
+      - ../services/logging/node_modules:/app/node_modules
     networks:
       - bot_network
 

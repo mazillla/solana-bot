@@ -2,7 +2,7 @@ services:
   redis:
     image: redis:7
     container_name: redis
-    restart: always
+    restart: unless-stopped
     ports:
       - "6379:6379"
     volumes:
@@ -13,7 +13,7 @@ services:
   postgres:
     image: postgres:15
     container_name: postgres
-    restart: always
+    restart: unless-stopped
     environment:
       POSTGRES_USER: solana
       POSTGRES_PASSWORD: solana
@@ -29,7 +29,7 @@ services:
   pgadmin:
     image: dpage/pgadmin4
     container_name: pgadmin
-    restart: always
+    restart: unless-stopped
     environment:
       PGADMIN_DEFAULT_EMAIL: admin@admin.com
       PGADMIN_DEFAULT_PASSWORD: admin
@@ -43,6 +43,7 @@ services:
   opensearch:
     image: opensearchproject/opensearch:2.13.0
     container_name: opensearch
+    restart: unless-stopped
     environment:
       - discovery.type=single-node
       - plugins.security.disabled=true
@@ -64,6 +65,7 @@ services:
   grafana:
     image: grafana/grafana:latest
     container_name: grafana
+    restart: unless-stopped
     depends_on:
       - opensearch
     ports:
@@ -82,6 +84,7 @@ services:
   fluent-bit:
     image: fluent/fluent-bit:3.0.4
     container_name: fluent-bit
+    restart: unless-stopped
     depends_on:
       - opensearch
     volumes:
@@ -96,13 +99,13 @@ services:
   redisinsight:
     image: redis/redisinsight:latest
     container_name: redisinsight
+    restart: unless-stopped
     ports:
       - "5540:5540" 
     networks:
       - bot_network
     volumes:
       - redisinsight-data:/data
-    restart: unless-stopped
     depends_on:
       - redis
 

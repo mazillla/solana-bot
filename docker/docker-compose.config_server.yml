@@ -1,13 +1,15 @@
 services:
   config_server:
     build:
-      context: ../
-      dockerfile: services/config_server/Dockerfile
+      context: ../services/config_server
+      dockerfile: Dockerfile
     ports:
       - "3001:3001"
     volumes:
+      - ../services/config_server:/app
+      - ../services/config_server/node_modules:/app/node_modules
       - ../config:/app/config
-    restart: always
+    restart: unless-stopped
     networks:
       - bot_network
 

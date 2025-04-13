@@ -9,39 +9,39 @@ vi.mock('redis', () => ({
   })),
 }));
 
-vi.mock('../utils/sharedLogger.js', () => ({
+vi.mock('@/utils/sharedLogger.js', () => ({
   sharedLogger: vi.fn(),
 }));
 
-vi.mock('../services/solana_subscriber/rpc/rpcPool.js', () => ({
+vi.mock('@/services/solana_subscriber/rpc/rpcPool.js', () => ({
   getAvailableRpc: vi.fn(),
 }));
 
-vi.mock('../services/solana_subscriber/rpc/rpcUtils.js', () => ({
+vi.mock('@/services/solana_subscriber/rpc/rpcUtils.js', () => ({
   getParsedTransactionWithTimeout: vi.fn(),
 }));
 
-vi.mock('../services/solana_subscriber/utils/redisLogSender.js', () => ({
+vi.mock('@/services/solana_subscriber/utils/redisLogSender.js', () => ({
   redisPublishLog: vi.fn(),
 }));
 
-vi.mock('../services/solana_subscriber/db/subscriptions.js', () => ({
+vi.mock('@/services/solana_subscriber/db/subscriptions.js', () => ({
   updateLastSignature: vi.fn(),
 }));
 
 // Импорты моков для обращения
-import { getAvailableRpc } from '../services/solana_subscriber/rpc/rpcPool.js';
-import { getParsedTransactionWithTimeout } from '../services/solana_subscriber/rpc/rpcUtils.js';
-import { redisPublishLog } from '../services/solana_subscriber/utils/redisLogSender.js';
-import { updateLastSignature } from '../services/solana_subscriber/db/subscriptions.js';
-import { sharedLogger } from '../utils/sharedLogger.js';
+import { getAvailableRpc } from '@/services/solana_subscriber/rpc/rpcPool.js';
+import { getParsedTransactionWithTimeout } from '@/services/solana_subscriber/rpc/rpcUtils.js';
+import { redisPublishLog } from '@/services/solana_subscriber/utils/redisLogSender.js';
+import { updateLastSignature } from '@/services/solana_subscriber/db/subscriptions.js';
+import { sharedLogger } from '@/utils/sharedLogger.js';
 
 describe('retryQueue', () => {
   let tryAgain;
 
   beforeEach(async () => {
     vi.clearAllMocks();
-    const mod = await import('../services/solana_subscriber/queue/retryQueue.js');
+    const mod = await import('@/services/solana_subscriber/queue/retryQueue.js');
     tryAgain = mod.__testOnlyTryAgain;
   });
 
@@ -125,7 +125,7 @@ describe('retryQueue', () => {
   it(
     'если tryAgain выбрасывает необработанную ошибку — логируется как retry_unhandled_error',
     async () => {
-      const mod = await import('../services/solana_subscriber/queue/retryQueue.js');
+      const mod = await import('@/services/solana_subscriber/queue/retryQueue.js');
 
       // Мокаем getAvailableRpc чтобы бросить ошибку
       getAvailableRpc.mockImplementation(() => {
@@ -152,7 +152,7 @@ describe('retryQueue', () => {
   it(
     'если нет доступных RPC — логируется как no_available_rpc и повторяется',
     async () => {
-      const mod = await import('../services/solana_subscriber/queue/retryQueue.js');
+      const mod = await import('@/services/solana_subscriber/queue/retryQueue.js');
 
       getAvailableRpc.mockResolvedValue(null); // нет RPC
 
@@ -185,7 +185,7 @@ describe('retryQueue', () => {
       const now = Date.now();
       vi.spyOn(Date, 'now').mockReturnValue(now);
 
-      const mod = await import('../services/solana_subscriber/queue/retryQueue.js');
+      const mod = await import('@/services/solana_subscriber/queue/retryQueue.js');
       await mod.__testOnlyTryAgain('tx-noblock');
 
       expect(redisPublishLog).toHaveBeenCalledWith(

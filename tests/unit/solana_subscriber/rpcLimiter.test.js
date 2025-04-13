@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from 'vitest';
-import { createLimiter } from '../services/solana_subscriber/rpc/rpcLimiter.js';
+import { createLimiter } from '@/services/solana_subscriber/rpc/rpcLimiter.js';
 
 describe('rpcLimiter', () => {
   it('выдаёт токены пока не исчерпаны', () => {

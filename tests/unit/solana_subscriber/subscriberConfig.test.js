@@ -1,13 +1,13 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 
-vi.mock('../services/solana_subscriber/db/db.js', () => ({
+vi.mock('@/services/solana_subscriber/db/db.js', () => ({
   pool: {
     query: vi.fn(),
   },
 }));
 
-import { pool } from '../services/solana_subscriber/db/db.js';
-import { getSubscriberConfigFromDb } from '../services/solana_subscriber/db/subscriberConfig.js';
+import { pool } from '@/services/solana_subscriber/db/db.js';
+import { getSubscriberConfigFromDb } from '@/services/solana_subscriber/db/subscriberConfig.js';
 
 describe('getSubscriberConfigFromDb', () => {
   beforeEach(() => {

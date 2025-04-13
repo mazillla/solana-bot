@@ -1,26 +1,26 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 
-vi.mock('../services/solana_subscriber/utils/redisLogSender.js', () => ({
+vi.mock('@/services/solana_subscriber/utils/redisLogSender.js', () => ({
   redisPublishLog: vi.fn(),
 }));
 
-vi.mock('../services/solana_subscriber/db/subscriptions.js', () => ({
+vi.mock('@/services/solana_subscriber/db/subscriptions.js', () => ({
   updateLastSignature: vi.fn(),
 }));
 
-vi.mock('../utils/sharedLogger.js', () => ({
+vi.mock('@/utils/sharedLogger.js', () => ({
   sharedLogger: vi.fn(),
 }));
 
-import { redisPublishLog } from '../services/solana_subscriber/utils/redisLogSender.js';
-import { updateLastSignature } from '../services/solana_subscriber/db/subscriptions.js';
-import { sharedLogger } from '../utils/sharedLogger.js';
+import { redisPublishLog } from '@/services/solana_subscriber/utils/redisLogSender.js';
+import { updateLastSignature } from '@/services/solana_subscriber/db/subscriptions.js';
+import { sharedLogger } from '@/utils/sharedLogger.js';
 
 import {
   enqueueRedisRetry,
   startRedisRetryWorker,
   stopRedisRetryWorker,
-} from '../services/solana_subscriber/queue/redisRetryQueue.js';
+} from '@/services/solana_subscriber/queue/redisRetryQueue.js';
 
 describe('redisRetryQueue', () => {
   const message = {

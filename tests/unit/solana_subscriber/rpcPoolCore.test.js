@@ -1,10 +1,10 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 
-vi.mock('../utils/sharedLogger.js', () => ({
+vi.mock('@/utils/sharedLogger.js', () => ({
   sharedLogger: vi.fn(),
 }));
 
-vi.mock('../services/solana_subscriber/rpc/rpcLimiter.js', () => ({
+vi.mock('@/services/solana_subscriber/rpc/rpcLimiter.js', () => ({
   createLimiter: vi.fn(() => ({
     removeToken: vi.fn(() => true),
   })),
@@ -16,10 +16,10 @@ import {
   getAvailableRpc,
   getWsConnections,
   closeRpcPool,
-} from '../services/solana_subscriber/rpc/rpcPoolCore.js';
+} from '@/services/solana_subscriber/rpc/rpcPoolCore.js';
 
-import { sharedLogger } from '../utils/sharedLogger.js';
-import { createLimiter } from '../services/solana_subscriber/rpc/rpcLimiter.js';
+import { sharedLogger } from '@/utils/sharedLogger.js';
+import { createLimiter } from '@/services/solana_subscriber/rpc/rpcLimiter.js';
 
 describe('rpcPoolCore', () => {
   const mockConn = (type) => ({

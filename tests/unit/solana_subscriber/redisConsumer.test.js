@@ -4,7 +4,7 @@ import {
   setRunning,
   startRedisConsumer,
   stopRedisConsumer,
-} from '../services/solana_subscriber/config/redisConsumer.js';
+} from '@/services/solana_subscriber/config/redisConsumer.js';
 
 const mockRedisClient = {
   connect: vi.fn(),
@@ -17,17 +17,17 @@ vi.mock('redis', () => ({
   createClient: vi.fn(() => mockRedisClient),
 }));
 
-vi.mock('../services/solana_subscriber/subscription/subscriptionManager.js', () => ({
+vi.mock('@/services/solana_subscriber/subscription/subscriptionManager.js', () => ({
   subscribeToAccount: vi.fn(),
   unsubscribeFromAccount: vi.fn(),
   resubscribeAll: vi.fn(),
 }));
 
-vi.mock('../services/solana_subscriber/config/configLoader.js', () => ({
+vi.mock('@/services/solana_subscriber/config/configLoader.js', () => ({
   updateAndReloadConfig: vi.fn(),
 }));
 
-vi.mock('../utils/sharedLogger.js', () => ({
+vi.mock('@/utils/sharedLogger.js', () => ({
   sharedLogger: vi.fn(),
 }));
 
@@ -35,9 +35,9 @@ import {
   subscribeToAccount,
   unsubscribeFromAccount,
   resubscribeAll,
-} from '../services/solana_subscriber/subscription/subscriptionManager.js';
-import { updateAndReloadConfig } from '../services/solana_subscriber/config/configLoader.js';
-import { sharedLogger } from '../utils/sharedLogger.js';
+} from '@/services/solana_subscriber/subscription/subscriptionManager.js';
+import { updateAndReloadConfig } from '@/services/solana_subscriber/config/configLoader.js';
+import { sharedLogger } from '@/utils/sharedLogger.js';
 
 describe('pollStream', () => {
   const makeMockMessage = (payload) => [

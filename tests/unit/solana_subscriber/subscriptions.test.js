@@ -1,18 +1,18 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 
 // 👇 мок до импорта
-vi.mock('../services/solana_subscriber/db/db.js', () => ({
+vi.mock('@/services/solana_subscriber/db/db.js', () => ({
   pool: {
     query: vi.fn(),
   },
 }));
 
-import { pool } from '../services/solana_subscriber/db/db.js';
+import { pool } from '@/services/solana_subscriber/db/db.js';
 import {
   getActiveSubscriptions,
   updateLastSignature,
   getLastSignatureForAccount,
-} from '../services/solana_subscriber/db/subscriptions.js';
+} from '@/services/solana_subscriber/db/subscriptions.js';
 
 describe('subscriptions', () => {
   beforeEach(() => {

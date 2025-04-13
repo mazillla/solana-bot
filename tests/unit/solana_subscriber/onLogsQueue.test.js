@@ -1,6 +1,6 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 
-vi.mock('../utils/sharedLogger.js', () => ({
+vi.mock('@', () => ({
   sharedLogger: vi.fn(),
 }));
 
@@ -9,9 +9,9 @@ import {
   dequeueSignature,
   getQueueLength,
   processQueue,
-} from '../services/solana_subscriber/queue/onLogsQueue.js';
+} from '@/services/solana_subscriber/queue/onLogsQueue.js';
 
-import { sharedLogger } from '../utils/sharedLogger.js';
+import { sharedLogger } from '@/utils/sharedLogger.js';
 
 describe('onLogsQueue', () => {
   beforeEach(() => {

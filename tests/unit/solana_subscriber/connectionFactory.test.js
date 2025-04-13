@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { connectionFactory } from '../services/solana_subscriber/rpc/connectionFactory.js';
+import { connectionFactory } from '@/services/solana_subscriber/rpc/connectionFactory.js';
 import { Connection } from '@solana/web3.js';
 
 // 🧪 Мокаем Connection для отслеживания

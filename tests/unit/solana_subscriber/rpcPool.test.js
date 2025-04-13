@@ -3,7 +3,7 @@ import {
   initRpcPool,
   handleDisconnect,
   __setReconnectInProgress,
-} from '../services/solana_subscriber/rpc/rpcPool.js';
+} from '@/services/solana_subscriber/rpc/rpcPool.js';
 import { Connection } from '@solana/web3.js'; // для проверки вызова
 
 vi.mock('@solana/web3.js', () => ({
@@ -15,15 +15,15 @@ const mockResubscribeAll = vi.fn();
 const mockCloseRpcPool = vi.fn();
 const mockInitCore = vi.fn();
 
-vi.mock('../utils/sharedLogger.js', () => ({
+vi.mock('@/utils/sharedLogger.js', () => ({
   sharedLogger: vi.fn(),
 }));
 
-vi.mock('../services/solana_subscriber/subscription/subscriptionManager.js', () => ({
+vi.mock('@/services/solana_subscriber/subscription/subscriptionManager.js', () => ({
   resubscribeAll: vi.fn(),
 }));
 
-vi.mock('../services/solana_subscriber/rpc/rpcPoolCore.js', () => ({
+vi.mock('@/services/solana_subscriber/rpc/rpcPoolCore.js', () => ({
   initRpcPool: vi.fn(),
   getAllRpcClients: vi.fn(),
   getAvailableRpc: vi.fn(),
@@ -31,15 +31,15 @@ vi.mock('../services/solana_subscriber/rpc/rpcPoolCore.js', () => ({
   closeRpcPool: vi.fn(),
 }));
 
-vi.mock('../services/solana_subscriber/config/configLoader.js', async () => ({
+vi.mock('@/services/solana_subscriber/config/configLoader.js', async () => ({
   getCurrentConfig: async () => ({
     rpc_endpoints: ['http://mock.rpc'],
   }),
 }));
 
-import * as rpcPoolCore from '../services/solana_subscriber/rpc/rpcPoolCore.js';
-import * as subscriptionManager from '../services/solana_subscriber/subscription/subscriptionManager.js';
-import * as sharedLoggerModule from '../utils/sharedLogger.js';
+import * as rpcPoolCore from '@/services/solana_subscriber/rpc/rpcPoolCore.js';
+import * as subscriptionManager from '@/services/solana_subscriber/subscription/subscriptionManager.js';
+import * as sharedLoggerModule from '@/utils/sharedLogger.js';
 
 describe('rpcPool.js', () => {
   beforeEach(() => {

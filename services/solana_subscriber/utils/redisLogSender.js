@@ -1,9 +1,22 @@
 import { createClient } from 'redis';
 
-const redis = createClient({ url: 'redis://redis:6379' });
-await redis.connect();
+let redis;
+let isConnected = false;
 
 export async function redisPublishLog(streamKey, messageObject) {
-  const payload = JSON.stringify(messageObject);
-  await redis.xAdd(streamKey, '*', { data: payload });
+  try {
+    if (!redis) {
+      redis = createClient({ url: 'redis://redis:6379' });
+    }
+
+    if (!isConnected) {
+      await redis.connect();
+      isConnected = true;
+    }
+
+    const payload = JSON.stringify(messageObject);
+    await redis.xAdd(streamKey, '*', { data: payload });
+  } catch (err) {
+    console.warn('[redisPublishLog] Redis error:', err.message);
+  }
 }

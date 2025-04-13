@@ -1,17 +1,17 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 
 // Мокаем getSubscriberConfigFromDb
-vi.mock('../services/solana_subscriber/db/subscriberConfig.js', () => ({
+vi.mock('@/services/solana_subscriber/db/subscriberConfig.js', () => ({
   getSubscriberConfigFromDb: vi.fn(),
 }));
 
-vi.mock('../utils/sharedLogger.js', () => ({
-  sharedLogger: vi.fn(),
-}));
+// vi.mock('../../\1', () => ({
+//   sharedLogger: vi.fn(),
+// }));
 
-import * as configLoader from '../services/solana_subscriber/config/configLoader.js'; // Импортируем сам модуль configLoader
-import { getSubscriberConfigFromDb } from '../services/solana_subscriber/db/subscriberConfig.js'; // Импортируем getSubscriberConfigFromDb
-import { sharedLogger } from '../utils/sharedLogger.js';
+import * as configLoader from '@/services/solana_subscriber/config/configLoader.js'; // Импортируем сам модуль configLoader
+import { getSubscriberConfigFromDb } from '@/services/solana_subscriber/db/subscriberConfig.js'; // Импортируем getSubscriberConfigFromDb
+import { sharedLogger } from '@/utils/sharedLogger.js';
 
 describe('configLoader', () => {
   const mockConfig = {
@@ -60,6 +60,14 @@ describe('configLoader', () => {
         level: 'info',
         message: '♻️ Конфигурация обновлена из БД по команде update_config',
       })
+    );
+  });
+  it('бросает ошибку, если getCurrentConfig вызван до загрузки', async () => {
+    vi.resetModules(); // сбрасываем кеш
+    const freshConfigLoader = await import('@/services/solana_subscriber/config/configLoader.js');
+
+    expect(() => freshConfigLoader.getCurrentConfig()).toThrowError(
+      'Конфигурация ещё не загружена. Используй loadSubscriberConfig() сначала.'
     );
   });
 });

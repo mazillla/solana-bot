@@ -1,20 +1,20 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 
-vi.mock('../services/solana_subscriber/config/configLoader.js', () => ({
+vi.mock('@/services/solana_subscriber/config/configLoader.js', () => ({
   getCurrentConfig: vi.fn(() => ({ rpc_timeout_ms: 100 })),
 }));
 
-vi.mock('../utils/sharedLogger.js', () => ({
+vi.mock('@/utils/sharedLogger.js', () => ({
   sharedLogger: vi.fn(),
 }));
 
-import { getCurrentConfig } from '../services/solana_subscriber/config/configLoader.js';
-import { sharedLogger } from '../utils/sharedLogger.js';
+import { getCurrentConfig } from '@/services/solana_subscriber/config/configLoader.js';
+import { sharedLogger } from '@/utils/sharedLogger.js';
 import {
   withTimeout,
   getParsedTransactionWithTimeout,
   getSignaturesForAddressWithTimeout,
-} from '../services/solana_subscriber/rpc/rpcUtils.js';
+} from '@/services/solana_subscriber/rpc/rpcUtils.js';
 
 describe('rpcUtils', () => {
   beforeEach(() => {

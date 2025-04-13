@@ -1,4 +1,4 @@
-import { getAvailableRpc } from '../rpc/rpcPool.js';
+import { getAvailableRpc } from '../rpc/rpcPoolCore.js';
 import { sharedLogger } from '../../../utils/sharedLogger.js';
 import { handleLogEvent } from './onLogsHandler.js';
 import { recoverTransactions } from './recoveryManager.js';
@@ -147,3 +147,6 @@ export async function resubscribeAll() {
     });
   }
 }
+
+// ⬇️ ДОБАВЬ ЭТО В САМОМ НИЗУ subscriptionManager.js
+export const __activeSubscriptions = activeSubscriptions;

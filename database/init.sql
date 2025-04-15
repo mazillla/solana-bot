@@ -1,5 +1,5 @@
 -- users: для авторизации и ролей
-CREATE TABLE users (
+CREATE TABLE IF NOT EXISTS users (
     id SERIAL PRIMARY KEY,
     email TEXT UNIQUE NOT NULL,
     password_hash TEXT NOT NULL,
@@ -8,7 +8,7 @@ CREATE TABLE users (
 );
 
 -- chains: цепочки мониторинга
-CREATE TABLE chains (
+CREATE TABLE IF NOT EXISTS chains (
     id SERIAL PRIMARY KEY,
     name TEXT NOT NULL,
     user_id INT REFERENCES users(id) ON DELETE CASCADE,
@@ -17,7 +17,7 @@ CREATE TABLE chains (
 );
 
 -- chain_tokens: звенья цепочек (один токен == одно звено)
-CREATE TABLE chain_tokens (
+CREATE TABLE IF NOT EXISTS chain_tokens (
     id SERIAL PRIMARY KEY,
     chain_id INT REFERENCES chains(id) ON DELETE CASCADE,
     mint_address TEXT NOT NULL,
@@ -48,7 +48,7 @@ CREATE TABLE chain_tokens (
 );
 
 -- token_accounts: Минтовый, Соучастники, Share
-CREATE TABLE token_accounts (
+CREATE TABLE IF NOT EXISTS token_accounts (
     id SERIAL PRIMARY KEY,
     token_id INT REFERENCES chain_tokens(id) ON DELETE CASCADE,
     address TEXT NOT NULL,
@@ -66,6 +66,12 @@ CREATE TABLE IF NOT EXISTS subscriber_config (
     silence_threshold_ms INTEGER NOT NULL DEFAULT 60000,
     queue_max_length INTEGER NOT NULL DEFAULT 1000,
     rpc_timeout_ms INTEGER NOT NULL DEFAULT 5000,
+    parse_concurrency INTEGER DEFAULT 3,
+    parse_queue_max_length INTEGER DEFAULT 1000,
+    max_parse_duration_ms INTEGER DEFAULT 86400000,
+    heartbeat_interval_ms INTEGER DEFAULT 30000,
+    default_history_max_age_ms INTEGER DEFAULT 604800000,
+    recovery_cooldown_ms INTEGER DEFAULT 60000,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
@@ -73,9 +79,9 @@ CREATE TABLE IF NOT EXISTS subscriber_config (
 CREATE TABLE IF NOT EXISTS subscriptions (
     chain_id TEXT NOT NULL,
     account TEXT NOT NULL,
-    subscription_type TEXT NOT NULL CHECK (subscription_type IN ('regular', 'spl_token')),
     active BOOLEAN DEFAULT TRUE,
     last_signature TEXT,
+    history_max_age_ms INTEGER,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     PRIMARY KEY (chain_id, account)

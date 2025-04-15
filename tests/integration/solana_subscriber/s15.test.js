@@ -1,79 +1,52 @@
-import { describe, it, expect, vi, beforeEach } from 'vitest';
-
-// Мокаем зависимости
-vi.mock('@/services/solana_subscriber/rpc/rpcUtils.js', () => ({
-  getParsedTransactionWithTimeout: vi.fn(),
-}));
-
-vi.mock('@/services/solana_subscriber/utils/redisLogSender.js', () => ({
-  redisPublishLog: vi.fn(),
-}));
-
-vi.mock('@/services/solana_subscriber/db/subscriptions.js', () => ({
-  updateLastSignature: vi.fn(),
-}));
-
-vi.mock('@/services/solana_subscriber/queue/retryQueue.js', () => ({
-  scheduleRetry: vi.fn(),
-}));
-
-vi.mock('@/services/solana_subscriber/queue/redisRetryQueue.js', () => ({
-  enqueueRedisRetry: vi.fn(),
-}));
-
-vi.mock('@/utils/sharedLogger.js', () => ({
-  sharedLogger: vi.fn(),
-}));
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { handleLogEvent } from '@/services/solana_subscriber/subscription/onLogsHandler.js';
+import * as rpcUtils from '@/services/solana_subscriber/rpc/rpcUtils.js';
+import * as retryQueue from '@/services/solana_subscriber/queue/retryQueue.js';
+import * as redisSender from '@/services/solana_subscriber/utils/redisLogSender.js';
+import * as subscriptions from '@/services/solana_subscriber/db/subscriptions.js';
+import * as sharedLogger from '@/utils/sharedLogger.js';
+import { getCurrentConfig } from '@/services/solana_subscriber/config/configLoader.js';
 
 vi.mock('@/services/solana_subscriber/config/configLoader.js', () => ({
-  getCurrentConfig: () => ({
-    rpc_timeout_ms: 5000,
-  }),
+  getCurrentConfig: vi.fn(),
 }));
 
-// Импортируем функцию для теста
-import { getParsedTransactionWithTimeout } from '@/services/solana_subscriber/rpc/rpcUtils.js';
-import { redisPublishLog } from '@/services/solana_subscriber/utils/redisLogSender.js';
-import { scheduleRetry } from '@/services/solana_subscriber/queue/retryQueue.js';
-
-import { handleLogEvent } from '@/services/solana_subscriber/subscription/onLogsHandler.js';
-
-// Общие данные для тестов
-const common = {
-  chain_id: 'chain1',
-  account: 'abc123',
-  signature: 'sig001',
-  subscription_type: 'regular',
-  rpc: { id: 'rpc-1', limiter: { removeToken: () => true } },
-};
-
-const flushPromises = () => new Promise(setImmediate);
-
-describe('onLogsHandler - S15: повторная попытка при getParsedTransaction === null', () => {
+describe('S15: getParsedTransaction возвращает null и вызывает повторную попытку', () => {
   beforeEach(() => {
-    vi.clearAllMocks();
+    vi.spyOn(rpcUtils, 'getParsedTransactionWithTimeout').mockResolvedValue(null);
+    vi.spyOn(retryQueue, 'scheduleRetry').mockResolvedValue();
+    vi.spyOn(redisSender, 'redisPublishLog').mockResolvedValue();
+    vi.spyOn(subscriptions, 'updateLastSignature').mockResolvedValue();
+    vi.spyOn(sharedLogger, 'sharedLogger').mockResolvedValue();
+    getCurrentConfig.mockReturnValue({ rpc_timeout_ms: 5000 });
   });
 
-  it('повторно обрабатывает транзакцию, если getParsedTransaction вернул null', async () => {
-    // Мокаем getParsedTransactionWithTimeout
-    getParsedTransactionWithTimeout
-      .mockResolvedValueOnce(null)  // Первый вызов — null
-      .mockResolvedValueOnce({ meta: {}, transaction: {} }); // Второй — валидная транзакция
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
 
-    const logInfo = { signature: 'sig001', err: null };
+  it('должен вызвать scheduleRetry и не отправлять лог в Redis', async () => {
+    const params = {
+      chain_id: 'test-chain',
+      account: 'test-account',
+      signature: 'missing-signature',
+      subscription_type: 'regular',
+      rpc: { id: 'test-rpc', limiter: { removeToken: () => true } },
+    };
 
-    // Запускаем обработку
-    await handleLogEvent(common);
+    await handleLogEvent(params);
 
-    // Ожидаем завершения всех промисов
-    await flushPromises();
+    expect(rpcUtils.getParsedTransactionWithTimeout).toHaveBeenCalledWith(params.rpc, 'missing-signature');
 
-    // Проверяем, что getParsedTransaction был вызван дважды
-    expect(getParsedTransactionWithTimeout).toHaveBeenCalledTimes(2);
-    expect(getParsedTransactionWithTimeout).toHaveBeenCalledWith('sig001', { commitment: 'confirmed' });
+    expect(retryQueue.scheduleRetry).toHaveBeenCalledWith('missing-signature');
 
-    // Проверяем, что retry был запланирован, но redisPublishLog не был вызван
-    expect(scheduleRetry).toHaveBeenCalledWith('sig001');
-    expect(redisPublishLog).not.toHaveBeenCalled();
+    expect(redisSender.redisPublishLog).not.toHaveBeenCalled();
+    expect(subscriptions.updateLastSignature).not.toHaveBeenCalled();
+
+    expect(sharedLogger.sharedLogger).not.toHaveBeenCalledWith(expect.objectContaining({
+      message: expect.objectContaining({
+        type: 'transaction_dispatched',
+      }),
+    }));
   });
 });

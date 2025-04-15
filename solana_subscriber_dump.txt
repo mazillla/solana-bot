@@ -1,0 +1,1545 @@
+
+/services/solana_subscriber/config/configLoader.js:
+import { getSubscriberConfigFromDb } from '../db/subscriberConfig.js'; // Убедитесь, что импорт правильный
+import { sharedLogger } from '../../../utils/sharedLogger.js';
+
+let currentConfig = null;
+const SERVICE_NAME = 'solana_subscriber';
+
+export async function loadSubscriberConfig() {
+  currentConfig = await getSubscriberConfigFromDb(); // Эта функция должна быть замокана в тестах
+
+  await sharedLogger({
+    service: SERVICE_NAME,
+    level: 'info',
+    message: '🔄 Конфигурация загружена из БД',
+  });
+
+  return currentConfig;
+}
+
+export function getCurrentConfig() {
+  if (!currentConfig) {
+    throw new Error('Конфигурация ещё не загружена. Используй loadSubscriberConfig() сначала.');
+  }
+  return currentConfig;
+}
+
+export async function updateAndReloadConfig() {
+  currentConfig = await getSubscriberConfigFromDb(); // Замена должна быть здесь
+
+  await sharedLogger({
+    service: SERVICE_NAME,
+    level: 'info',
+    message: '♻️ Конфигурация обновлена из БД по команде update_config',
+  });
+
+  return currentConfig;
+}
+
+
+/services/solana_subscriber/config/redisConsumer.js:
+// services/solana_subscriber/config/redisConsumer.js
+import { createClient } from 'redis';
+import { subscribeToAccount, unsubscribeFromAccount, resubscribeAll } from '../subscription/subscriptionManager.js';
+import { updateAndReloadConfig } from './configLoader.js';
+import { sharedLogger } from '../../../utils/sharedLogger.js';
+
+const SERVICE_NAME = 'solana_subscriber';
+const REDIS_STREAM_KEY = 'subscriber_control';
+let redisClient;
+let running = false;
+
+export async function startRedisConsumer() {
+  redisClient = createClient({ url: 'redis://redis:6379' });
+  await redisClient.connect();
+  running = true;
+  pollStream(redisClient);
+}
+
+export async function stopRedisConsumer() {
+  running = false;
+  if (redisClient) await redisClient.quit();
+}
+
+export function setRunning(value) {
+  running = value;
+}
+
+export async function pollStream(client, lastId = '$') {
+  while (running) {
+    try {
+      const response = await client.xRead(
+        { key: REDIS_STREAM_KEY, id: lastId },
+        { BLOCK: 5000, COUNT: 10 }
+      );
+
+      if (!response) {
+        continue;
+      }
+
+      for (const stream of response) {
+        for (const [id, entry] of stream.messages) {
+          const payload = JSON.parse(entry.data.data);
+          await processRedisCommand(payload);
+          lastId = id;
+        }
+      }
+    } catch (err) {
+      await sharedLogger({
+        service: SERVICE_NAME,
+        level: 'error',
+        message: {
+          type: 'redis_consumer_error',
+          error: err.message,
+        },
+      });
+      await new Promise(r => setTimeout(r, 2000));
+    }
+  }
+}
+
+// 🧠 Новый выделенный обработчик одной команды
+export async function processRedisCommand(payload) {
+  switch (payload.action) {
+    case 'subscribe':
+      await sharedLogger({
+        service: SERVICE_NAME,
+        level: 'info',
+        message: { type: 'subscribe_command', payload },
+      });
+
+      await subscribeToAccount({
+        chain_id: payload.chain_id,
+        account: payload.account,
+        subscription_type: payload.subscription_type,
+      });
+      break;
+
+    case 'unsubscribe':
+      await sharedLogger({
+        service: SERVICE_NAME,
+        level: 'info',
+        message: { type: 'unsubscribe_command', payload },
+      });
+
+      await unsubscribeFromAccount(`${payload.chain_id}:${payload.account}`);
+      break;
+
+    case 'update_config':
+      await handleUpdateConfigCommand();
+      break;
+
+    default:
+      await sharedLogger({
+        service: SERVICE_NAME,
+        level: 'warn',
+        message: { type: 'unknown_command', payload },
+      });
+  }
+}
+
+export async function handleUpdateConfigCommand() {
+  await sharedLogger({
+    service: SERVICE_NAME,
+    level: 'info',
+    message: { type: 'config_update_command' },
+  });
+
+  await updateAndReloadConfig();
+  await resubscribeAll();
+}
+
+
+/services/solana_subscriber/db/db.js:
+import pg from 'pg';
+import { sharedLogger } from '../../../utils/sharedLogger.js';
+
+export const pool = new pg.Pool({
+  connectionString: process.env.POSTGRES_URL || 'postgres://user:pass@localhost:5432/yourdb',
+});
+
+export async function initPostgres() {
+  await pool.connect(); // тестируем подключение
+  try {
+    await sharedLogger({
+      service: 'solana_subscriber',
+      level: 'info',
+      message: { type: 'postgres_connected', message: 'Подключено к PostgreSQL' },
+    });
+  } catch (_) {}
+}
+
+export async function closePostgres() {
+  await pool.end();
+  try {
+    await sharedLogger({
+      service: 'solana_subscriber',
+      level: 'info',
+      message: { type: 'postgres_disconnected', message: 'Отключено от PostgreSQL' },
+    });
+  } catch (_) {}
+}
+
+
+/services/solana_subscriber/db/subscriberConfig.js:
+import { pool } from './db.js';
+
+export async function getSubscriberConfigFromDb() {
+  const query = `
+    SELECT 
+      rpc_endpoints,
+      control_accounts,
+      silence_threshold_ms,
+      queue_max_length,
+      rpc_timeout_ms
+    FROM subscriber_config
+    ORDER BY updated_at DESC
+    LIMIT 1;
+  `;
+
+  const { rows } = await pool.query(query);
+
+  if (!rows.length) {
+    throw new Error('Нет доступной конфигурации в таблице subscriber_config');
+  }
+
+  return rows[0];
+}
+
+
+/services/solana_subscriber/db/subscriptions.js:
+import { pool } from './db.js';
+
+export async function getActiveSubscriptions() {
+  const { rows } = await pool.query(`
+    SELECT chain_id, account, subscription_type
+    FROM subscriptions
+    WHERE active = true
+  `);
+  return rows;
+}
+
+export async function updateLastSignature(chain_id, account, signature) {
+  await pool.query(
+    `
+    UPDATE subscriptions
+    SET last_signature = $1,
+        updated_at = NOW()
+    WHERE chain_id = $2 AND account = $3
+    `,
+    [signature, chain_id, account]
+  );
+}
+
+export async function getLastSignatureForAccount(chain_id, account) {
+  const { rows } = await pool.query(
+    `
+    SELECT last_signature FROM subscriptions
+    WHERE chain_id = $1 AND account = $2
+    `,
+    [chain_id, account]
+  );
+  return rows[0]?.last_signature || null;
+}
+
+
+/services/solana_subscriber/index.js:
+import { start, shutdown } from './start.js';
+
+process.on('SIGINT', shutdown);
+process.on('SIGTERM', shutdown);
+
+start();
+
+
+/services/solana_subscriber/queue/onLogsQueue.js:
+import { sharedLogger } from '@/utils/sharedLogger.js';
+
+const SERVICE_NAME = 'solana_subscriber';
+const MAX_QUEUE_LENGTH = 1000;
+
+const queue = [];
+const queuedSet = new Set(); // 🆕 Храним уникальные сигнатуры для deduplication
+
+export function enqueueSignature(signature) {
+  if (queuedSet.has(signature)) return;
+
+  if (queue.length >= MAX_QUEUE_LENGTH) {
+    try {
+      sharedLogger({
+        service: SERVICE_NAME,
+        level: 'warn',
+        message: {
+          event: 'queue_overflow',
+          type: 'rate_limit',
+          signature,
+        },
+      });
+    } catch (_) {}
+    return;
+  }
+
+  queue.push(signature);
+  queuedSet.add(signature);
+}
+
+export function dequeueSignature() {
+  const sig = queue.shift();
+  if (sig) queuedSet.delete(sig);
+  return sig;
+}
+
+export function getQueueLength() {
+  return queue.length;
+}
+
+export async function processQueue(handler) {
+  if (queue.length === 0) return;
+
+  try {
+    await sharedLogger({
+      service: SERVICE_NAME,
+      level: 'info',
+      message: {
+        event: 'queue_resumed',
+        queue_length: queue.length,
+      },
+    });
+  } catch (_) {}
+
+  while (queue.length > 0) {
+    const signature = dequeueSignature();
+    await handler(signature);
+  }
+}
+
+
+/services/solana_subscriber/queue/onLogsQueueWorker.js:
+import { getAvailableRpc } from '../rpc/rpcPool.js';
+import { getParsedTransactionWithTimeout } from '../rpc/rpcUtils.js';
+import { enqueueSignature, dequeueSignature, getQueueLength } from './onLogsQueue.js';
+import { scheduleRetry } from './retryQueue.js';
+import { sharedLogger } from '../../../utils/sharedLogger.js';
+import { redisPublishLog } from '../utils/redisLogSender.js';
+import { updateLastSignature } from '../db/subscriptions.js';
+import { getCurrentConfig } from '../config/configLoader.js';
+
+const SERVICE_NAME = 'solana_subscriber';
+let running = false;
+
+export function startOnLogsQueueWorker() {
+  running = true;
+  pollQueueLoop();
+}
+
+export function stopOnLogsQueueWorker() {
+  running = false;
+}
+
+async function pollQueueLoop() {
+  while (running) {
+    await __runSinglePollIteration();
+    await new Promise(r => setTimeout(r, 2000));
+  }
+}
+
+export async function __runSinglePollIteration() {
+  const length = getQueueLength();
+
+  if (length > 0) {
+    try {
+      await sharedLogger({
+        service: SERVICE_NAME,
+        level: 'info',
+        message: {
+          event: 'queue_resumed',
+          queue_length: length,
+        },
+      });
+    } catch (_) {}
+  }
+
+  while (getQueueLength() > 0 && running) {
+    await __processOneQueueItem();
+  }
+}
+
+export async function __processOneQueueItem({
+  chain_id = 'unknown',
+  account = 'unknown',
+  subscription_type = 'regular',
+} = {}) {
+  const signature = dequeueSignature();
+  const rpc = await getAvailableRpc();
+  if (!rpc) {
+    enqueueSignature(signature);
+    return;
+  }
+
+  const parsed = await getParsedTransactionWithTimeout(rpc, signature);
+  if (!parsed) {
+    await scheduleRetry(signature);
+    return;
+  }
+
+  if (parsed.meta?.err) {
+    try {
+      await sharedLogger({
+        service: SERVICE_NAME,
+        level: 'warn',
+        message: {
+          type: 'failed_transaction',
+          signature,
+          error: parsed.meta.err,
+        },
+      });
+    } catch (_) {}
+    return;
+  }
+
+  const blockTime = parsed.blockTime || null;
+  const timestamp = blockTime ? blockTime * 1000 : Date.now();
+
+  const message = {
+    chain_id,
+    account,
+    signature,
+    log: parsed,
+    subscription_type,
+    blockTime,
+    timestamp,
+  };
+
+  const streamKey =
+    subscription_type === 'share'
+      ? 'solana_logs_share'
+      : subscription_type === 'mint'
+      ? 'solana_logs_mint'
+      : subscription_type === 'spl_token'
+      ? 'solana_logs_spl'
+      : subscription_type === 'control'
+      ? 'solana_logs_control'
+      : 'solana_logs_regular';
+
+  try {
+    await redisPublishLog(streamKey, message);
+
+    try {
+      await updateLastSignature(chain_id, account, signature);
+    } catch (err) {
+      try {
+        await sharedLogger({
+          service: SERVICE_NAME,
+          level: 'error',
+          message: {
+            type: 'update_signature_failed',
+            signature,
+            error: err.message,
+          },
+        });
+      } catch (_) {}
+    }
+
+    try {
+      await sharedLogger({
+        service: SERVICE_NAME,
+        level: 'info',
+        message: {
+          type: 'transaction_dispatched_from_queue',
+          signature,
+          rpc_id: rpc.id,
+        },
+      });
+    } catch (_) {}
+  } catch (err) {
+    try {
+      await sharedLogger({
+        service: SERVICE_NAME,
+        level: 'error',
+        message: {
+          type: 'redis_publish_failed',
+          signature,
+          error: err.message,
+        },
+      });
+    } catch (_) {}
+    await scheduleRetry(signature);
+  }
+}
+
+export { pollQueueLoop };
+export function __setRunning(value) {
+  running = value;
+}
+export { __runSinglePollIteration }; // 👈
+
+/services/solana_subscriber/queue/redisRetryQueue.js:
+import { redisPublishLog } from '../utils/redisLogSender.js';
+import { updateLastSignature } from '../db/subscriptions.js';
+import { sharedLogger } from '../../../utils/sharedLogger.js';
+
+const SERVICE_NAME = 'solana_subscriber';
+const retryQueue = [];
+
+let running = false;
+
+export function startRedisRetryWorker() {
+  running = true;
+  workerLoop();
+}
+
+export function stopRedisRetryWorker() {
+  running = false;
+}
+
+export function enqueueRedisRetry({ streamKey, message }) {
+  retryQueue.push({ streamKey, message, retries: 0 });
+}
+
+async function workerLoop() {
+  while (running) {
+    if (retryQueue.length === 0) {
+      await sleep(2000);
+      continue;
+    }
+
+    const item = retryQueue.shift();
+    const { streamKey, message, retries } = item;
+
+    try {
+      await redisPublishLog(streamKey, message);
+      await updateLastSignature(message.chain_id, message.account, message.signature);
+
+      try {
+        await sharedLogger({
+          service: SERVICE_NAME,
+          level: 'info',
+          message: {
+            type: 'redis_retry_success',
+            signature: message.signature,
+          },
+        });
+      } catch (_) {}
+    } catch (err) {
+      if (retries < 5) {
+        retryQueue.push({ ...item, retries: retries + 1 });
+      } else {
+        try {
+          await sharedLogger({
+            service: SERVICE_NAME,
+            level: 'error',
+            message: {
+              type: 'redis_retry_failed',
+              signature: message.signature,
+              error: err.message,
+            },
+          });
+        } catch (_) {}
+      }
+    }
+
+    await sleep(1000);
+  }
+}
+
+function sleep(ms) {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
+
+/services/solana_subscriber/queue/retryQueue.js:
+import { sharedLogger } from '../../../utils/sharedLogger.js';
+import { getAvailableRpc } from '../rpc/rpcPool.js';
+import { redisPublishLog } from '../utils/redisLogSender.js';
+import { updateLastSignature } from '../db/subscriptions.js';
+import { withAbortTimeout } from '../../../utils/withAbortTimeout.js';
+import { getCurrentConfig } from '../config/configLoader.js';
+
+const SERVICE_NAME = 'solana_subscriber';
+const retriesMap = new Map();
+
+export async function scheduleRetry(signature) {
+  const retries = retriesMap.get(signature) || 0;
+
+  if (retries >= 3) {
+    try {
+      await sharedLogger({
+        service: SERVICE_NAME,
+        level: 'error',
+        message: {
+          type: 'unresolved_transaction',
+          signature,
+        },
+      });
+    } catch (_) {}
+    retriesMap.delete(signature);
+    return;
+  }
+
+  retriesMap.set(signature, retries + 1);
+  const delay = 1000 * Math.pow(2, retries);
+
+  try {
+    await sharedLogger({
+      service: SERVICE_NAME,
+      level: 'debug',
+      message: {
+        type: 'retry_scheduled',
+        signature,
+        attempt: retries + 1,
+        delay,
+      },
+    });
+  } catch (_) {}
+
+  setTimeout(() => {
+    tryAgain(signature).catch(async (err) => {
+      try {
+        await sharedLogger({
+          service: SERVICE_NAME,
+          level: 'error',
+          message: {
+            type: 'retry_unhandled_error',
+            signature,
+            error: err.message,
+          },
+        });
+      } catch (_) {}
+    });
+  }, delay);
+}
+
+async function tryAgain(signature) {
+  try {
+    await sharedLogger({
+      service: SERVICE_NAME,
+      level: 'debug',
+      message: {
+        type: 'try_again',
+        signature,
+      },
+    });
+  } catch (_) {}
+
+  const rpc = await getAvailableRpc();
+  console.log('⚙️ RPC:', rpc);
+
+  if (!rpc) {
+    console.log('❌ Нет RPC');
+    try {
+      await sharedLogger({
+        service: SERVICE_NAME,
+        level: 'debug',
+        message: {
+          type: 'no_available_rpc',
+          signature,
+        },
+      });
+    } catch (_) {}
+    await scheduleRetry(signature);
+    return;
+  }
+
+  const timeoutMs = getCurrentConfig().rpc_timeout_ms || 5000;
+
+  let parsed = null;
+  try {
+    parsed = await withAbortTimeout(async (_signal) => {
+      return await rpc.httpConn.getParsedTransaction(signature, {
+        commitment: 'confirmed',
+        maxSupportedTransactionVersion: 0,
+      });
+    }, timeoutMs);
+  } catch (e) {
+    console.log('❌ Ошибка при getParsedTransaction:', e);
+  }
+
+  console.log('📦 Parsed result:', parsed);
+
+  if (!parsed || parsed.meta?.err) {
+    console.log('⚠️ Parsed пустой или с ошибкой:', parsed?.meta?.err);
+    try {
+      await sharedLogger({
+        service: SERVICE_NAME,
+        level: 'debug',
+        message: {
+          type: 'parse_fail',
+          signature,
+        },
+      });
+    } catch (_) {}
+    await scheduleRetry(signature);
+    return;
+  }
+
+  const blockTime = parsed.blockTime || null;
+  const timestamp = blockTime ? blockTime * 1000 : Date.now();
+
+  const message = {
+    chain_id: 'unknown',
+    account: 'unknown',
+    signature,
+    log: parsed,
+    subscription_type: 'regular',
+    blockTime,
+    timestamp,
+  };
+
+  console.log('✅ Всё ок — вызываем redisPublishLog');
+
+  try {
+    await redisPublishLog('solana_logs_regular', message);
+    await updateLastSignature('unknown', 'unknown', signature);
+
+    try {
+      await sharedLogger({
+        service: SERVICE_NAME,
+        level: 'info',
+        message: {
+          type: 'retried_transaction_success',
+          signature,
+        },
+      });
+    } catch (_) {}
+
+    retriesMap.delete(signature);
+  } catch (err) {
+    try {
+      await sharedLogger({
+        service: SERVICE_NAME,
+        level: 'error',
+        message: {
+          type: 'logging_error',
+          signature,
+          error: err.message,
+        },
+      });
+    } catch (_) {}
+    await scheduleRetry(signature);
+  }
+}
+
+export const __retriesMap = retriesMap;
+export const __testOnlyTryAgain = tryAgain;
+
+
+
+
+/services/solana_subscriber/rpc/connectionFactory.js:
+import { Connection } from '@solana/web3.js';
+
+export function connectionFactory(httpUrl, wsUrl = null) {
+  return new Connection(httpUrl, {
+    commitment: 'confirmed',
+    ...(wsUrl ? { wsEndpoint: wsUrl } : {}),
+  });
+}
+
+
+/services/solana_subscriber/rpc/handleDisconnect.js:
+import { closeRpcPool } from './rpcPoolCore.js';
+import { sharedLogger } from '../../../utils/sharedLogger.js';
+import { resubscribeAll } from '../subscription/subscriptionManager.js';
+import { getCurrentConfig } from '../config/configLoader.js';
+
+export async function handleDisconnect(rpcId) {
+  try {
+    await sharedLogger({
+      service: 'solana_subscriber',
+      level: 'warn',
+      message: {
+        type: 'ws_disconnect',
+        rpc_id: rpcId,
+      },
+    });
+  } catch (_) {}
+
+  try {
+    await closeRpcPool();
+
+    const { rpc_endpoints } = getCurrentConfig();
+
+    const { initRpcPool } = await import('./rpcPool.js');
+    await initRpcPool(rpc_endpoints);
+
+    await resubscribeAll();
+
+    await sharedLogger({
+      service: 'solana_subscriber',
+      level: 'info',
+      message: {
+        type: 'reconnect',
+        rpc_id: rpcId,
+      },
+    });
+  } catch (err) {
+    await sharedLogger({
+      service: 'solana_subscriber',
+      level: 'error',
+      message: {
+        type: 'reconnect_failed',
+        rpc_id: rpcId,
+        error: err.message,
+      },
+    });
+  }
+}
+
+
+/services/solana_subscriber/rpc/rpcLimiter.js:
+// простой токен-бакет лимитер
+export function createLimiter(maxRequestsPerSec) {
+    let tokens = maxRequestsPerSec;
+    const interval = setInterval(() => {
+      tokens = maxRequestsPerSec;
+    }, 1000);
+  
+    return {
+      removeToken() {
+        if (tokens > 0) {
+          tokens--;
+          return true;
+        }
+        return false;
+      },
+      stop() {
+        clearInterval(interval);
+      },
+    };
+  }
+  
+
+/services/solana_subscriber/rpc/rpcPool.js:
+import { connectionFactory } from './connectionFactory.js';
+import { sharedLogger } from '../../../utils/sharedLogger.js';
+import { resubscribeAll } from '../subscription/subscriptionManager.js';
+import {
+  initRpcPool as coreInitRpcPool,
+  getAllRpcClients,
+  getAvailableRpc,
+  getWsConnections,
+  closeRpcPool,
+} from './rpcPoolCore.js';
+
+import { handleDisconnect } from './handleDisconnect.js'; // ✅ подключаем вынесенную логику
+
+let reconnectInProgress = false;
+
+export async function initRpcPool(endpoints) {
+  await coreInitRpcPool(endpoints, connectionFactory);
+
+  for (const rpc of getAllRpcClients()) {
+    const ws = rpc.wsConn._rpcWebSocket;
+    if (ws) {
+      ws.on('close', () => handleDisconnect(rpc.id));
+      ws.on('error', () => handleDisconnect(rpc.id));
+    }
+  }
+
+  console.log(`🌐 Инициализировано ${getAllRpcClients().length} RPC`);
+}
+
+export function __setReconnectInProgress(val) {
+  reconnectInProgress = val;
+}
+
+export {
+  getAllRpcClients,
+  getWsConnections,
+  getAvailableRpc,
+  closeRpcPool,
+};
+
+
+/services/solana_subscriber/rpc/rpcPoolCore.js:
+import { createLimiter } from './rpcLimiter.js';
+import { sharedLogger } from '../../../utils/sharedLogger.js';
+
+
+const rpcPool = [];
+
+export function getAllRpcClients() {
+  return rpcPool;
+}
+
+export function getWsConnections() {
+  return rpcPool.map((r) => r.wsConn);
+}
+
+export async function initRpcPool(endpoints, connectionFactory) {
+  rpcPool.length = 0;
+
+  for (let i = 0; i < endpoints.length; i++) {
+    const endpoint = endpoints[i];
+    const rpcId = `rpc-${i + 1}`;
+
+    const limiter = createLimiter(endpoint.rate_limits?.max_requests_per_sec || 10);
+    const httpConn = connectionFactory(endpoint.http);
+    const wsConn = connectionFactory(endpoint.http, endpoint.ws);
+
+    rpcPool.push({
+      id: rpcId,
+      httpConn,
+      wsConn,
+      limiter,
+    });
+
+    // return ws to upper level to attach listeners
+    const ws = wsConn._rpcWebSocket;
+    if (ws) {
+      ws.rpcId = rpcId; // allow upper layer to track
+    }
+  }
+}
+
+export async function closeRpcPool() {
+  for (const rpc of rpcPool) {
+    try {
+      rpc.wsConn._rpcWebSocket?.close();
+    } catch (err) {
+      await sharedLogger({
+        service: 'solana_subscriber',
+        level: 'warn',
+        message: {
+          type: 'ws_close_failed',
+          rpc_id: rpc.id,
+          error: err.message,
+        },
+      });
+    }
+  }
+}
+
+export async function getAvailableRpc() {
+  for (const rpc of rpcPool) {
+    if (rpc.limiter.removeToken()) {
+      return rpc;
+    }
+  }
+  return null;
+}
+
+
+/services/solana_subscriber/rpc/rpcUtils.js:
+import { getCurrentConfig } from '../config/configLoader.js';
+import { sharedLogger } from '../../../utils/sharedLogger.js';
+import { withAbortTimeout } from '../../../utils/withAbortTimeout.js';
+
+const SERVICE_NAME = 'solana_subscriber';
+
+export async function getParsedTransactionWithTimeout(rpc, signature) {
+  const timeoutMs = getCurrentConfig().rpc_timeout_ms || 5000;
+
+  try {
+    return await withAbortTimeout(async (_signal) => {
+      return await rpc.httpConn.getParsedTransaction(signature, {
+        commitment: 'confirmed',
+        maxSupportedTransactionVersion: 0,
+      });
+    }, timeoutMs);
+  } catch (err) {
+    try {
+      await sharedLogger({
+        service: SERVICE_NAME,
+        level: 'warn',
+        message: {
+          type: 'rpc_timeout',
+          rpc_id: rpc.id,
+          method: 'getParsedTransaction',
+          signature,
+          error: err.message,
+        },
+      });
+    } catch (_) {}
+    return null;
+  }
+}
+
+export async function getSignaturesForAddressWithTimeout(rpc, address, options = {}) {
+  const timeoutMs = getCurrentConfig().rpc_timeout_ms || 5000;
+
+  try {
+    return await withAbortTimeout(async (_signal) => {
+      return await rpc.httpConn.getSignaturesForAddress(address, options);
+    }, timeoutMs);
+  } catch (err) {
+    try {
+      await sharedLogger({
+        service: SERVICE_NAME,
+        level: 'warn',
+        message: {
+          type: 'rpc_timeout',
+          rpc_id: rpc.id,
+          method: 'getSignaturesForAddress',
+          address: address.toBase58?.() || address,
+          error: err.message,
+        },
+      });
+    } catch (_) {}
+    return null;
+  }
+}
+
+
+/services/solana_subscriber/start.js:
+import { initPostgres, closePostgres } from './db/db.js';
+import { loadSubscriberConfig } from './config/configLoader.js';
+import { initRpcPool, closeRpcPool } from './rpc/rpcPool.js';
+import { getActiveSubscriptions } from './db/subscriptions.js';
+import {
+  startAllSubscriptions,
+  stopAllSubscriptions,
+} from './subscription/subscriptionManager.js';
+import {
+  startOnLogsQueueWorker,
+  stopOnLogsQueueWorker,
+} from './queue/onLogsQueueWorker.js';
+import {
+  startRedisRetryWorker,
+  stopRedisRetryWorker,
+} from './queue/redisRetryQueue.js';
+import {
+  startRedisConsumer,
+  stopRedisConsumer,
+} from './config/redisConsumer.js';
+import { sharedLogger } from '../../utils/sharedLogger.js';
+
+let shuttingDown = false;
+
+export async function start() {
+  try {
+    // ⛑️ Оборачиваем первый sharedLogger и прерываем запуск при ошибке
+    try {
+      await sharedLogger({
+        service: 'solana_subscriber',
+        level: 'info',
+        message: '⚙ Инициализация микросервиса...',
+      });
+    } catch (err) {
+      console.warn('❌ sharedLogger init failed:', err.message);
+      process.exit(1);
+      return;
+    }
+
+    await initPostgres();
+
+    const config = await loadSubscriberConfig();
+    await initRpcPool(config.rpc_endpoints);
+
+    const subscriptions = await getActiveSubscriptions();
+
+    if (subscriptions?.length) {
+      await startAllSubscriptions(subscriptions);
+    }
+
+    startRedisConsumer();
+    startOnLogsQueueWorker();
+    startRedisRetryWorker();
+
+    try {
+      await sharedLogger({
+        service: 'solana_subscriber',
+        level: 'info',
+        message: '🚀 solana_subscriber успешно запущен',
+      });
+    } catch (_) {}
+  } catch (err) {
+    try {
+      await sharedLogger({
+        service: 'solana_subscriber',
+        level: 'error',
+        message: `Ошибка при инициализации: ${err.message}`,
+      });
+    } catch (_) {}
+
+    process.exit(1);
+  }
+}
+
+export async function shutdown() {
+  if (shuttingDown) return;
+  shuttingDown = true;
+
+  try {
+    await stopRedisConsumer();
+    await stopOnLogsQueueWorker();
+    await stopRedisRetryWorker();
+    await stopAllSubscriptions();
+    await closeRpcPool();
+    await closePostgres();
+
+    try {
+      await sharedLogger({
+        service: 'solana_subscriber',
+        level: 'info',
+        message: '✅ Завершено корректно',
+      });
+    } catch (_) {}
+
+    process.exit(0);
+  } catch (err) {
+    try {
+      await sharedLogger({
+        service: 'solana_subscriber',
+        level: 'error',
+        message: `❌ Ошибка при завершении: ${err.message}`,
+      });
+    } catch (_) {}
+
+    process.exit(1);
+  }
+}
+
+
+/services/solana_subscriber/subscription/onLogsHandler.js:
+import { getParsedTransactionWithTimeout } from '@/services/solana_subscriber/rpc/rpcUtils.js';
+import { scheduleRetry } from '@/services/solana_subscriber/queue/retryQueue.js';
+import { enqueueSignature } from '@/services/solana_subscriber/queue/onLogsQueue.js';
+import { sharedLogger } from '@/utils/sharedLogger.js';
+import { getCurrentConfig } from '@/services/solana_subscriber/config/configLoader.js';
+import { redisPublishLog } from '@/services/solana_subscriber/utils/redisLogSender.js';
+import { updateLastSignature } from '@/services/solana_subscriber/db/subscriptions.js';
+import { enqueueRedisRetry } from '@/services/solana_subscriber/queue/redisRetryQueue.js';
+
+const SERVICE_NAME = 'solana_subscriber';
+
+export async function handleLogEvent({ chain_id, account, signature, subscription_type, rpc }) {
+  try {
+    const config = getCurrentConfig();
+
+    const allowedTypes = new Set(['regular', 'control', 'mint', 'share', 'spl_token']);
+    if (!allowedTypes.has(subscription_type)) {
+      try {
+        await sharedLogger({
+          service: SERVICE_NAME,
+          level: 'warn',
+          message: {
+            type: 'unsupported_subscription_type',
+            subscription_type,
+            signature,
+            chain_id,
+            account,
+          },
+        });
+      } catch (_) {}
+      return;
+    }
+
+    if (!rpc.limiter.removeToken()) {
+      enqueueSignature(signature);
+      try {
+        await sharedLogger({
+          service: SERVICE_NAME,
+          level: 'warn',
+          message: {
+            event: 'rate_limit',
+            signature,
+            rpc_id: rpc.id,
+            chain_id,
+            account,
+          },
+        });
+      } catch (_) {}
+      return;
+    }
+
+    const parsed = await getParsedTransactionWithTimeout(rpc, signature);
+    if (!parsed) {
+      await scheduleRetry(signature);
+      return;
+    }
+
+    if (parsed.meta?.err) {
+      try {
+        await sharedLogger({
+          service: SERVICE_NAME,
+          level: 'warn',
+          message: {
+            type: 'failed_transaction',
+            signature,
+            error: parsed.meta.err,
+          },
+        });
+      } catch (_) {}
+      return;
+    }
+
+    const blockTime = parsed.blockTime || null;
+    const timestamp = blockTime ? blockTime * 1000 : Date.now();
+
+    const message = {
+      chain_id,
+      account,
+      signature,
+      log: parsed,
+      subscription_type,
+      blockTime,
+      timestamp,
+    };
+
+    const streamKey =
+      subscription_type === 'spl_token'
+        ? 'solana_logs_spl'
+        : 'solana_logs_regular';
+
+    try {
+      await redisPublishLog(streamKey, message);
+      await updateLastSignature(chain_id, account, signature);
+
+      try {
+        await sharedLogger({
+          service: SERVICE_NAME,
+          level: 'info',
+          message: {
+            type: 'transaction_dispatched',
+            stream: streamKey,
+            signature,
+            chain_id,
+            rpc_id: rpc.id,
+          },
+        });
+      } catch (_) {}
+    } catch (err) {
+      enqueueRedisRetry({ streamKey, message });
+
+      try {
+        await sharedLogger({
+          service: SERVICE_NAME,
+          level: 'error',
+          message: {
+            type: 'redis_publish_failed',
+            signature,
+            error: err.message,
+          },
+        });
+      } catch (_) {}
+    }
+  } catch (err) {
+    await scheduleRetry(signature);
+    try {
+      await sharedLogger({
+        service: SERVICE_NAME,
+        level: 'error',
+        message: {
+          type: 'log_event_exception',
+          signature,
+          error: err.message,
+        },
+      });
+    } catch (_) {}
+  }
+}
+
+
+/services/solana_subscriber/subscription/recoveryManager.js:
+import { getSignaturesForAddressWithTimeout, getParsedTransactionWithTimeout } from '../rpc/rpcUtils.js';
+import { getAvailableRpc } from '../rpc/rpcPool.js'; // ✅ Правильный импорт
+import { redisPublishLog } from '../utils/redisLogSender.js';
+import { sharedLogger } from '../../../utils/sharedLogger.js';
+import { updateLastSignature } from '../db/subscriptions.js';
+
+const SERVICE_NAME = 'solana_subscriber';
+const MAX_BATCH = 1000;
+
+export async function recoverTransactions({ chain_id, account, last_signature, subscription_type }) {
+  const rpc = await getAvailableRpc();
+  if (!rpc) {
+    try {
+      await sharedLogger({
+        service: SERVICE_NAME,
+        level: 'warn',
+        message: {
+          type: 'recovery_skipped',
+          reason: 'no_available_rpc',
+          chain_id,
+          account,
+        },
+      });
+    } catch (_) {}
+    return;
+  }
+
+  try {
+    await sharedLogger({
+      service: SERVICE_NAME,
+      level: 'info',
+      message: {
+        type: 'recovery_started',
+        chain_id,
+        account,
+        rpc_id: rpc.id,
+        from: last_signature || 'start',
+      },
+    });
+  } catch (_) {}
+
+  const allSignatures = [];
+  let before = undefined;
+  let keepFetching = true;
+
+  while (keepFetching) {
+    const options = {
+      limit: MAX_BATCH,
+      ...(before ? { before } : {}),
+      ...(last_signature ? { until: last_signature } : {}),
+    };
+
+    const sigs = await getSignaturesForAddressWithTimeout(rpc, account, options);
+    if (!sigs || sigs.length === 0) break;
+
+    const confirmed = sigs.filter(sig => sig.confirmationStatus === 'confirmed');
+    allSignatures.push(...confirmed);
+
+    if (sigs.length < MAX_BATCH) {
+      keepFetching = false;
+    } else {
+      before = sigs[sigs.length - 1].signature;
+    }
+  }
+
+  const ordered = allSignatures.sort((a, b) => a.slot - b.slot);
+  const messages = [];
+
+  for (const sig of ordered) {
+    const parsed = await getParsedTransactionWithTimeout(rpc, sig.signature);
+    if (!parsed || parsed.meta?.err) continue;
+
+    const blockTime = parsed.blockTime || null;
+    const timestamp = blockTime ? blockTime * 1000 : Date.now();
+
+    messages.push({
+      chain_id,
+      account,
+      signature: sig.signature,
+      log: parsed,
+      subscription_type,
+      blockTime,
+      timestamp,
+    });
+  }
+
+  const streamKey =
+    subscription_type === 'spl_token'
+      ? 'solana_logs_spl'
+      : 'solana_logs_regular';
+
+  for (const msg of messages) {
+    try {
+      await redisPublishLog(streamKey, msg);
+    } catch (err) {
+      await sharedLogger({
+        service: SERVICE_NAME,
+        level: 'error',
+        message: {
+          type: 'recovery_publish_failed',
+          signature: msg.signature,
+          error: err.message,
+        },
+      });
+      return; // ⛔ останавливаем, last_signature не обновляем
+    }
+  }
+
+  const lastProcessed = messages[messages.length - 1];
+  if (lastProcessed) {
+    await updateLastSignature(chain_id, account, lastProcessed.signature);
+  }
+
+  try {
+    await sharedLogger({
+      service: SERVICE_NAME,
+      level: 'info',
+      message: {
+        type: 'recovery_completed',
+        chain_id,
+        account,
+        recovered_count: messages.length,
+      },
+    });
+  } catch (_) {}
+}
+
+
+/services/solana_subscriber/subscription/subscriptionManager.js:
+import { getAvailableRpc } from '../rpc/rpcPoolCore.js';
+import { sharedLogger } from '../../../utils/sharedLogger.js';
+import { handleLogEvent } from './onLogsHandler.js';
+import { recoverTransactions } from './recoveryManager.js';
+import { getLastSignatureForAccount } from '../db/subscriptions.js';
+import { getCurrentConfig } from '../config/configLoader.js';
+
+const SERVICE_NAME = 'solana_subscriber';
+
+const activeSubscriptions = new Map(); // key: `${chain_id}:${account}`
+
+// 👇 глобальная переменная для тестов (можно подменять в тесте)
+globalThis.__mockedSubscribeToAccount = null;
+
+export async function startAllSubscriptions(subscriptionList) {
+  for (const sub of subscriptionList) {
+    await subscribeToAccount(sub);
+  }
+}
+
+export async function stopAllSubscriptions() {
+  for (const key of activeSubscriptions.keys()) {
+    await unsubscribeFromAccount(key);
+  }
+}
+
+export async function subscribeToAccount({ chain_id, account, subscription_type, last_signature = null }) {
+  const key = `${chain_id}:${account}`;
+  if (activeSubscriptions.has(key)) return;
+
+  const rpc = await getAvailableRpc();
+  if (!rpc) {
+    await sharedLogger({
+      service: SERVICE_NAME,
+      level: 'warn',
+      message: {
+        type: 'subscribe_skipped',
+        reason: 'no_available_rpc',
+        chain_id,
+        account,
+        subscription_type,
+      },
+    });
+    return;
+  }
+
+  // 🔁 если нет last_signature от команды — берём из БД
+  if (!last_signature) {
+    last_signature = await getLastSignatureForAccount(chain_id, account);
+  }
+
+  // ✅ запуск восстановления
+  if (last_signature || subscription_type === 'regular') {
+    await recoverTransactions({
+      chain_id,
+      account,
+      last_signature,
+      subscription_type,
+    });
+  }
+
+  // ▶️ подписка onLogs
+  const id = rpc.wsConn.onLogs(account, async (logInfo) => {
+    if (!logInfo?.signature || logInfo.err) return;
+
+    await handleLogEvent({
+      chain_id,
+      account,
+      signature: logInfo.signature,
+      subscription_type,
+      rpc,
+    });
+  });
+
+  activeSubscriptions.set(key, {
+    chain_id,
+    account,
+    rpc_id: rpc.id,
+    subscription_type,
+    subscriptionId: id,
+    wsConn: rpc.wsConn,
+  });
+
+  await sharedLogger({
+    service: SERVICE_NAME,
+    level: 'info',
+    message: {
+      type: 'subscribe',
+      chain_id,
+      account,
+      subscription_type,
+      rpc_id: rpc.id,
+    },
+  });
+}
+
+export async function unsubscribeFromAccount(key) {
+  const sub = activeSubscriptions.get(key);
+  if (!sub) return;
+
+  try {
+    await sub.wsConn.removeOnLogsListener(sub.subscriptionId);
+  } catch (err) {
+    await sharedLogger({
+      service: SERVICE_NAME,
+      level: 'warn',
+      message: {
+        type: 'unsubscribe_failed',
+        error: err.message,
+        key,
+      },
+    });
+  }
+
+  activeSubscriptions.delete(key);
+
+  const [chain_id, account] = key.split(':');
+  await sharedLogger({
+    service: SERVICE_NAME,
+    level: 'info',
+    message: {
+      type: 'unsubscribe',
+      chain_id,
+      account,
+      subscription_type: sub.subscription_type,
+      rpc_id: sub.rpc_id,
+    },
+  });
+}
+
+export async function resubscribeAll() {
+  const oldSubs = Array.from(activeSubscriptions.values());
+  await stopAllSubscriptions();
+  for (const sub of oldSubs) {
+    await (globalThis.__mockedSubscribeToAccount || subscribeToAccount)({
+      chain_id: sub.chain_id,
+      account: sub.account,
+      subscription_type: sub.subscription_type,
+    });
+
+    await sharedLogger({
+      service: SERVICE_NAME,
+      level: 'info',
+      message: {
+        type: 'resubscribe',
+        chain_id: sub.chain_id,
+        account: sub.account,
+        subscription_type: sub.subscription_type,
+      },
+    });
+  }
+}
+
+// ⬇️ экспортируем Map для тестов
+export const __activeSubscriptions = activeSubscriptions;
+
+
+/services/solana_subscriber/utils/redisLogSender.js:
+import { createClient } from 'redis';
+
+let redis;
+let isConnected = false;
+
+export async function redisPublishLog(streamKey, messageObject) {
+  try {
+    if (!redis) {
+      redis = createClient({ url: 'redis://redis:6379' });
+    }
+
+    if (!isConnected) {
+      await redis.connect();
+      isConnected = true;
+    }
+
+    const payload = JSON.stringify(messageObject);
+    await redis.xAdd(streamKey, '*', { data: payload });
+  } catch (err) {
+    console.warn('[redisPublishLog] Redis error:', err.message);
+  }
+}
+

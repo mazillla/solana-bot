@@ -1,39 +1,71 @@
+// services/solana_subscriber/start.js
+import { initPostgres, closePostgres } from './db/db.js';
 import { loadSubscriberConfig } from './config/configLoader.js';
 import { initRpcPool, closeRpcPool } from './rpc/rpcPool.js';
 import { getActiveSubscriptions } from './db/subscriptions.js';
-import { startRedisConsumer, stopRedisConsumer } from './config/redisConsumer.js';
-import { startAllSubscriptions, stopAllSubscriptions } from './subscription/subscriptionManager.js';
-import { startOnLogsQueueWorker, stopOnLogsQueueWorker } from './queue/onLogsQueueWorker.js';
-import { startRedisRetryWorker, stopRedisRetryWorker } from './queue/redisRetryQueue.js';
+import {
+  startAllSubscriptions,
+  stopAllSubscriptions,
+} from './subscription/subscriptionManager.js';
+import { startParseQueueWorker } from './queue/parseQueue.js';
+import { startPublishQueueWorker } from './queue/publishQueue.js';
+import { startSignatureUpdateWorker } from './queue/signatureUpdateBuffer.js';
+import {
+  startRedisConsumer,
+  stopRedisConsumer,
+} from './config/redisConsumer.js';
+import { startHeartbeat, stopHeartbeat } from '../../utils/heartbeat.js';
+import { getRedisClient, disconnectRedisClient } from '../../utils/redisClientSingleton.js';
 import { sharedLogger } from '../../utils/sharedLogger.js';
-import { initPostgres, closePostgres } from './db/db.js';
 
-const SERVICE_NAME = 'solana_subscriber';
 let shuttingDown = false;
 
 export async function start() {
   try {
-    await sharedLogger({ service: SERVICE_NAME, level: 'info', message: '🔧 Инициализация solana_subscriber...' });
+    try {
+      await sharedLogger({
+        service: 'solana_subscriber',
+        level: 'info',
+        message: '⚙ Инициализация микросервиса...',
+      });
+    } catch (err) {
+      console.warn('❌ sharedLogger init failed:', err.message);
+      process.exit(1);
+      return;
+    }
 
-    await initPostgres();
-
+    await getRedisClient();       // ✅ централизованное подключение
+    await initPostgres();         // ✅ база
     const config = await loadSubscriberConfig();
-    await sharedLogger({ service: SERVICE_NAME, level: 'info', message: '✅ Конфигурация загружена' });
-
-    await initRpcPool(config.rpc_endpoints);
+    await initRpcPool(config.rpc_endpoints); // ✅ RPC
 
     const subscriptions = await getActiveSubscriptions();
-    await sharedLogger({ service: SERVICE_NAME, level: 'info', message: `🔌 Найдено ${subscriptions.length} активных подписок` });
+    if (subscriptions?.length) {
+      await startAllSubscriptions(subscriptions);
+    }
 
-    await startAllSubscriptions(subscriptions);
+    await startRedisConsumer();   // ✅ команды из Redis
+    startParseQueueWorker();      // ✅ очередь сигнатур
+    startPublishQueueWorker();    // ✅ очередь транзакций
+    startSignatureUpdateWorker(); // ✅ очередь updateLastSignature
+    await startHeartbeat('solana_subscriber'); // ❤️
 
-    startRedisConsumer();
-    startOnLogsQueueWorker();
-    startRedisRetryWorker();
-
-    await sharedLogger({ service: SERVICE_NAME, level: 'info', message: '🚀 solana_subscriber успешно запущен' });
+    try {
+      await sharedLogger({
+        service: 'solana_subscriber',
+        level: 'info',
+        message: '🚀 solana_subscriber успешно запущен',
+      });
+    } catch (_) {}
   } catch (err) {
-    await sharedLogger({ service: SERVICE_NAME, level: 'error', message: `Ошибка при инициализации: ${err.message}` });
+    try {
+      await sharedLogger({
+        service: 'solana_subscriber',
+        level: 'error',
+        message: `❌ Ошибка при инициализации: ${err.message}`,
+      });
+    } catch (_) {}
+
     process.exit(1);
   }
 }
@@ -41,20 +73,33 @@ export async function start() {
 export async function shutdown() {
   if (shuttingDown) return;
   shuttingDown = true;
-  await sharedLogger({ service: SERVICE_NAME, level: 'info', message: '🧼 Завершение работы...' });
 
   try {
     await stopRedisConsumer();
-    stopOnLogsQueueWorker();
-    stopRedisRetryWorker();
     await stopAllSubscriptions();
     await closeRpcPool();
     await closePostgres();
+    await stopHeartbeat();
+    await disconnectRedisClient(); // ✅ централизованное отключение
 
-    await sharedLogger({ service: SERVICE_NAME, level: 'info', message: '✅ Завершено корректно' });
+    try {
+      await sharedLogger({
+        service: 'solana_subscriber',
+        level: 'info',
+        message: '✅ Завершено корректно',
+      });
+    } catch (_) {}
+
     process.exit(0);
   } catch (err) {
-    await sharedLogger({ service: SERVICE_NAME, level: 'error', message: `Ошибка при завершении: ${err.message}` });
+    try {
+      await sharedLogger({
+        service: 'solana_subscriber',
+        level: 'error',
+        message: `❌ Ошибка при завершении: ${err.message}`,
+      });
+    } catch (_) {}
+
     process.exit(1);
   }
 }

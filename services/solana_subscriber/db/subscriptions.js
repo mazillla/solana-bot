@@ -2,7 +2,7 @@ import { pool } from './db.js';
 
 export async function getActiveSubscriptions() {
   const { rows } = await pool.query(`
-    SELECT chain_id, account, subscription_type
+    SELECT chain_id, account
     FROM subscriptions
     WHERE active = true
   `);

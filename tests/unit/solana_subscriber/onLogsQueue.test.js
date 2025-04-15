@@ -1,6 +1,8 @@
+// tests/unit/onLogsQueue.test.js
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 
-vi.mock('@', () => ({
+// Мокаем логгер
+vi.mock('@/utils/sharedLogger.js', () => ({
   sharedLogger: vi.fn(),
 }));
 
@@ -30,8 +32,15 @@ describe('onLogsQueue', () => {
     expect(getQueueLength()).toBe(0);
   });
 
+  it('enqueueSignature не добавляет дубликаты', () => {
+    enqueueSignature('dup');
+    enqueueSignature('dup'); // дубликат не должен добавиться
+
+    expect(getQueueLength()).toBe(1);
+    expect(dequeueSignature()).toBe('dup');
+  });
+
   it('enqueue превышает лимит — sharedLogger вызывается', () => {
-    // Заполним очередь до лимита
     for (let i = 0; i < 1000; i++) {
       enqueueSignature(`sig-${i}`);
     }
@@ -47,6 +56,17 @@ describe('onLogsQueue', () => {
         }),
       })
     );
+  });
+
+  it('enqueueSignature не падает при ошибке логгера', () => {
+    sharedLogger.mockImplementationOnce(() => {
+      throw new Error('log fail');
+    });
+
+    for (let i = 0; i < 1000; i++) enqueueSignature(`s-${i}`);
+    enqueueSignature('overflow-test'); // вызовет ошибку логгера
+
+    expect(getQueueLength()).toBe(1000); // не увеличилась
   });
 
   it('processQueue вызывает handler для всех элементов и очищает очередь', async () => {
@@ -89,5 +109,18 @@ describe('onLogsQueue', () => {
         }),
       })
     );
+  });
+
+  it('processQueue не падает при ошибке логгера', async () => {
+    sharedLogger.mockImplementationOnce(() => {
+      throw new Error('log fail');
+    });
+
+    const handler = vi.fn();
+    enqueueSignature('sigX');
+
+    await processQueue(handler);
+
+    expect(handler).toHaveBeenCalledWith('sigX');
   });
 });

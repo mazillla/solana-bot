@@ -8,7 +8,6 @@ import { updateLastSignature } from '../db/subscriptions.js';
 import { getCurrentConfig } from '../config/configLoader.js';
 
 const SERVICE_NAME = 'solana_subscriber';
-
 let running = false;
 
 export function startOnLogsQueueWorker() {
@@ -22,8 +21,16 @@ export function stopOnLogsQueueWorker() {
 
 async function pollQueueLoop() {
   while (running) {
-    const length = getQueueLength();
-    if (length > 0) {
+    await __runSinglePollIteration();
+    await new Promise(r => setTimeout(r, 2000));
+  }
+}
+
+export async function __runSinglePollIteration() {
+  const length = getQueueLength();
+
+  if (length > 0) {
+    try {
       await sharedLogger({
         service: SERVICE_NAME,
         level: 'info',
@@ -32,75 +39,119 @@ async function pollQueueLoop() {
           queue_length: length,
         },
       });
-    }
+    } catch (_) {}
+  }
 
-    while (getQueueLength() > 0 && running) {
-      const signature = dequeueSignature();
-      const rpc = await getAvailableRpc();
-      if (!rpc) {
-        enqueueSignature(signature); // вернуть обратно
-        break;
-      }
+  while (getQueueLength() > 0 && running) {
+    await __processOneQueueItem();
+  }
+}
 
-      const parsed = await getParsedTransactionWithTimeout(rpc, signature);
-      if (!parsed) {
-        await scheduleRetry(signature);
-        continue;
-      }
+export async function __processOneQueueItem({
+  chain_id = 'unknown',
+  account = 'unknown',
+  subscription_type = 'regular',
+} = {}) {
+  const signature = dequeueSignature();
+  const rpc = await getAvailableRpc();
+  if (!rpc) {
+    enqueueSignature(signature);
+    return;
+  }
 
-      if (parsed.meta?.err) {
-        await sharedLogger({
-          service: SERVICE_NAME,
-          level: 'warn',
-          message: {
-            type: 'failed_transaction',
-            signature,
-            error: parsed.meta.err,
-          },
-        });
-        continue;
-      }
+  const parsed = await getParsedTransactionWithTimeout(rpc, signature);
+  if (!parsed) {
+    await scheduleRetry(signature);
+    return;
+  }
 
-      const blockTime = parsed.blockTime || null;
-      const timestamp = blockTime ? blockTime * 1000 : Date.now();
+  if (parsed.meta?.err) {
+    try {
+      await sharedLogger({
+        service: SERVICE_NAME,
+        level: 'warn',
+        message: {
+          type: 'failed_transaction',
+          signature,
+          error: parsed.meta.err,
+        },
+      });
+    } catch (_) {}
+    return;
+  }
 
-      const message = {
-        chain_id: 'unknown',
-        account: 'unknown',
-        signature,
-        log: parsed,
-        subscription_type: 'regular', // не знаем точно, можно пометить явно
-        blockTime,
-        timestamp,
-      };
+  const blockTime = parsed.blockTime || null;
+  const timestamp = blockTime ? blockTime * 1000 : Date.now();
 
+  const message = {
+    chain_id,
+    account,
+    signature,
+    log: parsed,
+    subscription_type,
+    blockTime,
+    timestamp,
+  };
+
+  const streamKey =
+    subscription_type === 'share'
+      ? 'solana_logs_share'
+      : subscription_type === 'mint'
+      ? 'solana_logs_mint'
+      : subscription_type === 'spl_token'
+      ? 'solana_logs_spl'
+      : subscription_type === 'control'
+      ? 'solana_logs_control'
+      : 'solana_logs_regular';
+
+  try {
+    await redisPublishLog(streamKey, message);
+
+    try {
+      await updateLastSignature(chain_id, account, signature);
+    } catch (err) {
       try {
-        await redisPublishLog('solana_logs_regular', message);
-        await sharedLogger({
-          service: SERVICE_NAME,
-          level: 'info',
-          message: {
-            type: 'transaction_dispatched_from_queue',
-            signature,
-            rpc_id: rpc.id,
-          },
-        });
-      } catch (err) {
         await sharedLogger({
           service: SERVICE_NAME,
           level: 'error',
           message: {
-            type: 'redis_publish_failed',
+            type: 'update_signature_failed',
             signature,
             error: err.message,
           },
         });
-        await scheduleRetry(signature);
-      }
+      } catch (_) {}
     }
 
-    await new Promise(r => setTimeout(r, 2000));
+    try {
+      await sharedLogger({
+        service: SERVICE_NAME,
+        level: 'info',
+        message: {
+          type: 'transaction_dispatched_from_queue',
+          signature,
+          rpc_id: rpc.id,
+        },
+      });
+    } catch (_) {}
+  } catch (err) {
+    try {
+      await sharedLogger({
+        service: SERVICE_NAME,
+        level: 'error',
+        message: {
+          type: 'redis_publish_failed',
+          signature,
+          error: err.message,
+        },
+      });
+    } catch (_) {}
+    await scheduleRetry(signature);
   }
 }
 
 export { pollQueueLoop };
+export function __setRunning(value) {
+  running = value;
+}
+export { __runSinglePollIteration }; // 👈

@@ -1,13 +1,16 @@
+// services/solana_subscriber/subscription/subscriptionManager.js
 import { getAvailableRpc } from '../rpc/rpcPoolCore.js';
 import { sharedLogger } from '../../../utils/sharedLogger.js';
 import { handleLogEvent } from './onLogsHandler.js';
 import { recoverTransactions } from './recoveryManager.js';
-import { getLastSignatureForAccount } from '../db/subscriptions.js'; // добавим
-import { getCurrentConfig } from '../config/configLoader.js';
+import { getLastSignatureForAccount } from '../db/subscriptions.js';
+import { isPrioritized } from '../queue/perAccountQueueManager.js';
+import { sendSubscriptionStateUpdate } from '../utils/subscriptionStatePublisher.js'; // 💡 создадим этот файл
 
 const SERVICE_NAME = 'solana_subscriber';
-
 const activeSubscriptions = new Map(); // key: `${chain_id}:${account}`
+
+globalThis.__mockedSubscribeToAccount = null;
 
 export async function startAllSubscriptions(subscriptionList) {
   for (const sub of subscriptionList) {
@@ -21,7 +24,7 @@ export async function stopAllSubscriptions() {
   }
 }
 
-export async function subscribeToAccount({ chain_id, account, subscription_type, last_signature = null }) {
+export async function subscribeToAccount({ chain_id, account, last_signature = null, history_max_age_ms = null }) {
   const key = `${chain_id}:${account}`;
   if (activeSubscriptions.has(key)) return;
 
@@ -35,45 +38,33 @@ export async function subscribeToAccount({ chain_id, account, subscription_type,
         reason: 'no_available_rpc',
         chain_id,
         account,
-        subscription_type,
       },
     });
     return;
   }
 
-  // 🔁 если нет last_signature от команды — берём из БД
   if (!last_signature) {
     last_signature = await getLastSignatureForAccount(chain_id, account);
   }
 
-  // ✅ запуск восстановления
-  if (last_signature || subscription_type === 'regular') {
-    await recoverTransactions({
-      chain_id,
-      account,
-      last_signature,
-      subscription_type,
-    });
-  }
+  // ✅ восстановление
+  await recoverTransactions({
+    chain_id,
+    account,
+    last_signature,
+    history_max_age_ms,
+  });
 
-  // ▶️ подписка onLogs
+  // ▶️ подписка
   const id = rpc.wsConn.onLogs(account, async (logInfo) => {
     if (!logInfo?.signature || logInfo.err) return;
-
-    await handleLogEvent({
-      chain_id,
-      account,
-      signature: logInfo.signature,
-      subscription_type,
-      rpc,
-    });
+    await handleLogEvent({ chain_id, account, signature: logInfo.signature });
   });
 
   activeSubscriptions.set(key, {
     chain_id,
     account,
     rpc_id: rpc.id,
-    subscription_type,
     subscriptionId: id,
     wsConn: rpc.wsConn,
   });
@@ -85,10 +76,19 @@ export async function subscribeToAccount({ chain_id, account, subscription_type,
       type: 'subscribe',
       chain_id,
       account,
-      subscription_type,
       rpc_id: rpc.id,
     },
   });
+
+  // ✅ статус connected: true
+  try {
+    await sendSubscriptionStateUpdate({
+      chain_id,
+      account,
+      active: true,
+      connected: true,
+    });
+  } catch (_) {}
 }
 
 export async function unsubscribeFromAccount(key) {
@@ -119,20 +119,31 @@ export async function unsubscribeFromAccount(key) {
       type: 'unsubscribe',
       chain_id,
       account,
-      subscription_type: sub.subscription_type,
       rpc_id: sub.rpc_id,
     },
   });
+
+  // ✅ статус connected: false
+  try {
+    await sendSubscriptionStateUpdate({
+      chain_id,
+      account,
+      active: false,
+      connected: false,
+    });
+  } catch (_) {}
 }
 
 export async function resubscribeAll() {
   const oldSubs = Array.from(activeSubscriptions.values());
   await stopAllSubscriptions();
+
+  await publishAllDisconnected(); // 👈 перед восстановлением
+
   for (const sub of oldSubs) {
-    await subscribeToAccount({
+    await (globalThis.__mockedSubscribeToAccount || subscribeToAccount)({
       chain_id: sub.chain_id,
       account: sub.account,
-      subscription_type: sub.subscription_type,
     });
 
     await sharedLogger({
@@ -142,11 +153,25 @@ export async function resubscribeAll() {
         type: 'resubscribe',
         chain_id: sub.chain_id,
         account: sub.account,
-        subscription_type: sub.subscription_type,
       },
     });
   }
 }
 
-// ⬇️ ДОБАВЬ ЭТО В САМОМ НИЗУ subscriptionManager.js
+// 🔔 Вызывается при handleDisconnect
+export async function publishAllDisconnected() {
+  for (const key of activeSubscriptions.keys()) {
+    const [chain_id, account] = key.split(':');
+    try {
+      await sendSubscriptionStateUpdate({
+        chain_id,
+        account,
+        active: true,
+        connected: false,
+      });
+    } catch (_) {}
+  }
+}
+
+// экспорт для тестов
 export const __activeSubscriptions = activeSubscriptions;

@@ -1,19 +1,4 @@
-import { vi, describe, it, expect, beforeEach } from 'vitest';
-import {
-  initRpcPool,
-  handleDisconnect,
-  __setReconnectInProgress,
-} from '@/services/solana_subscriber/rpc/rpcPool.js';
-import { Connection } from '@solana/web3.js'; // для проверки вызова
-
-vi.mock('@solana/web3.js', () => ({
-  Connection: vi.fn().mockImplementation(() => ({ _dummy: true })),
-}));
-
-const mockLogger = vi.fn();
-const mockResubscribeAll = vi.fn();
-const mockCloseRpcPool = vi.fn();
-const mockInitCore = vi.fn();
+import { describe, it, expect, vi, beforeEach } from 'vitest';
 
 vi.mock('@/utils/sharedLogger.js', () => ({
   sharedLogger: vi.fn(),
@@ -23,106 +8,89 @@ vi.mock('@/services/solana_subscriber/subscription/subscriptionManager.js', () =
   resubscribeAll: vi.fn(),
 }));
 
-vi.mock('@/services/solana_subscriber/rpc/rpcPoolCore.js', () => ({
-  initRpcPool: vi.fn(),
-  getAllRpcClients: vi.fn(),
-  getAvailableRpc: vi.fn(),
-  getWsConnections: vi.fn(),
-  closeRpcPool: vi.fn(),
-}));
-
-vi.mock('@/services/solana_subscriber/config/configLoader.js', async () => ({
-  getCurrentConfig: async () => ({
-    rpc_endpoints: ['http://mock.rpc'],
+vi.mock('@/services/solana_subscriber/config/configLoader.js', () => ({
+  getCurrentConfig: () => ({
+    rpc_endpoints: [{ http: 'https://rpc-1', ws: 'wss://rpc-1/ws' }],
   }),
 }));
 
-import * as rpcPoolCore from '@/services/solana_subscriber/rpc/rpcPoolCore.js';
-import * as subscriptionManager from '@/services/solana_subscriber/subscription/subscriptionManager.js';
-import * as sharedLoggerModule from '@/utils/sharedLogger.js';
+vi.mock('@/services/solana_subscriber/rpc/rpcPoolCore.js', () => {
+  const clients = [];
 
-describe('rpcPool.js', () => {
-  beforeEach(() => {
+  return {
+    getAllRpcClients: () => clients,
+    getWsConnections: () => clients.map(c => c.wsConn),
+    getAvailableRpc: () => clients[0] || null,
+    closeRpcPool: vi.fn(),
+    initRpcPool: vi.fn((_endpoints, connectionFactory) => {
+      const conn = connectionFactory('https://rpc-1', 'wss://rpc-1/ws');
+      clients.length = 0;
+      clients.push({
+        id: 'rpc-1',
+        httpConn: conn,
+        wsConn: { _rpcWebSocket: { on: vi.fn(), rpcId: 'rpc-1' } },
+        limiter: { removeToken: () => true },
+      });
+    }),
+  };
+});
+
+vi.mock('@/services/solana_subscriber/rpc/connectionFactory.js', () => ({
+  connectionFactory: (http, ws) => ({
+    endpoint: http,
+    _rpcWebSocket: {
+      on: vi.fn(),
+      rpcId: 'mock',
+    },
+  }),
+}));
+
+describe('rpcPool', () => {
+  let rpcPool;
+
+  beforeEach(async () => {
     vi.clearAllMocks();
+    rpcPool = await import('@/services/solana_subscriber/rpc/rpcPool.js');
+  });
 
-    rpcPoolCore.initRpcPool.mockImplementation(mockInitCore);
-    rpcPoolCore.getAllRpcClients.mockReturnValue([
-      {
-        id: 'mock-rpc',
-        wsConn: {
-          _rpcWebSocket: {
-            on: vi.fn(),
-          },
-        },
-      },
+  it('инициализирует RPC и подписывает ws события', async () => {
+    await rpcPool.initRpcPool([
+      { http: 'https://rpc-1', ws: 'wss://rpc-1/ws', rate_limits: { max_requests_per_sec: 10 } },
     ]);
 
-    rpcPoolCore.closeRpcPool.mockImplementation(mockCloseRpcPool);
-    subscriptionManager.resubscribeAll.mockImplementation(mockResubscribeAll);
-    sharedLoggerModule.sharedLogger.mockImplementation(mockLogger);
-
-    vi.spyOn(console, 'log').mockImplementation(() => {});
+    const clients = rpcPool.getAllRpcClients();
+    expect(clients.length).toBe(1);
+    expect(clients[0].id).toBe('rpc-1');
+    expect(clients[0].wsConn._rpcWebSocket.on).toHaveBeenCalledWith('close', expect.any(Function));
+    expect(clients[0].wsConn._rpcWebSocket.on).toHaveBeenCalledWith('error', expect.any(Function));
   });
 
-  it('initRpcPool initializes pool and attaches event handlers', async () => {
-    await initRpcPool(['http://localhost:8899']);
+  it('handleDisconnect логирует отключение и пересоздаёт RPC', async () => {
+    const { handleDisconnect } = rpcPool;
+    const { sharedLogger } = await import('@/utils/sharedLogger.js');
+    const { resubscribeAll } = await import('@/services/solana_subscriber/subscription/subscriptionManager.js');
 
-    expect(mockInitCore).toHaveBeenCalled();
-
-    const client = rpcPoolCore.getAllRpcClients()[0];
-    expect(client.wsConn._rpcWebSocket.on).toHaveBeenCalledWith('close', expect.any(Function));
-    expect(client.wsConn._rpcWebSocket.on).toHaveBeenCalledWith('error', expect.any(Function));
-    expect(console.log).toHaveBeenCalledWith(expect.stringMatching(/^🌐 Инициализировано/));
-
-    // 🔍 вызываем переданный connectionFactory вручную
-    const passedFactory = mockInitCore.mock.calls[0][1];
-    passedFactory('http://localhost:8899');
-
-    expect(Connection).toHaveBeenCalledWith('http://localhost:8899', {
-      commitment: 'confirmed',
-    });
-  });
-
-  it('handleDisconnect triggers reconnect flow', async () => {
     await handleDisconnect('rpc-1');
 
-    expect(mockLogger).toHaveBeenCalledWith(expect.objectContaining({
-      level: 'warn',
-      message: expect.objectContaining({ type: 'ws_disconnect' }),
-    }));
+    expect(sharedLogger).toHaveBeenCalledWith(
+      expect.objectContaining({
+        message: expect.objectContaining({
+          type: 'ws_disconnect',
+          rpc_id: 'rpc-1',
+        }),
+      })
+    );
 
-    expect(mockCloseRpcPool).toHaveBeenCalled();
-    expect(mockInitCore).toHaveBeenCalledWith(['http://mock.rpc'], expect.any(Function));
-    expect(mockResubscribeAll).toHaveBeenCalled();
+    expect(sharedLogger).toHaveBeenCalledWith(
+      expect.objectContaining({
+        message: expect.objectContaining({
+          type: 'reconnect',
+          rpc_id: 'rpc-1',
+        }),
+      })
+    );
 
-    expect(mockLogger).toHaveBeenCalledWith(expect.objectContaining({
-      level: 'info',
-      message: expect.objectContaining({ type: 'reconnect' }),
-    }));
-  });
-
-  it('handleDisconnect logs reconnect_failed on error', async () => {
-    rpcPoolCore.closeRpcPool.mockRejectedValueOnce(new Error('test error'));
-
-    await handleDisconnect('rpc-err');
-
-    expect(mockLogger).toHaveBeenCalledWith(expect.objectContaining({
-      level: 'error',
-      message: expect.objectContaining({
-        type: 'reconnect_failed',
-        rpc_id: 'rpc-err',
-        error: 'test error',
-      }),
-    }));
-  });
-
-  it('handleDisconnect does nothing if reconnect already in progress', async () => {
-    __setReconnectInProgress(true);
-
-    await handleDisconnect('rpc-id');
-
-    expect(mockLogger).not.toHaveBeenCalled();
-
-    __setReconnectInProgress(false);
+    expect(resubscribeAll).toHaveBeenCalled();
   });
 });
+

@@ -1,4 +1,5 @@
-import { createClient } from 'redis';
+// services/solana_subscriber/config/redisConsumer.js
+import { getRedisClient } from '../../../utils/redisClientSingleton.js';
 import { subscribeToAccount, unsubscribeFromAccount, resubscribeAll } from '../subscription/subscriptionManager.js';
 import { updateAndReloadConfig } from './configLoader.js';
 import { sharedLogger } from '../../../utils/sharedLogger.js';
@@ -9,18 +10,21 @@ let redisClient;
 let running = false;
 
 export async function startRedisConsumer() {
-  redisClient = createClient({ url: 'redis://redis:6379' });
-  await redisClient.connect();
+  redisClient = await getRedisClient();
   running = true;
   pollStream(redisClient);
 }
 
 export async function stopRedisConsumer() {
   running = false;
-  if (redisClient) await redisClient.quit();
+  // Закрытие redisClient теперь централизованное через shutdown()
 }
 
-async function pollStream(client, lastId = '$') {
+export function setRunning(value) {
+  running = value;
+}
+
+export async function pollStream(client, lastId = '$') {
   while (running) {
     try {
       const response = await client.xRead(
@@ -28,59 +32,12 @@ async function pollStream(client, lastId = '$') {
         { BLOCK: 5000, COUNT: 10 }
       );
 
-      if (!response) {
-        running = false;
-        break;
-      }
+      if (!response) continue;
 
       for (const stream of response) {
         for (const [id, entry] of stream.messages) {
           const payload = JSON.parse(entry.data.data);
-
-          switch (payload.action) {
-            case 'subscribe':
-              await sharedLogger({
-                service: SERVICE_NAME,
-                level: 'info',
-                message: { type: 'subscribe_command', payload },
-              });
-
-              await subscribeToAccount({
-                chain_id: payload.chain_id,
-                account: payload.account,
-                subscription_type: payload.subscription_type,
-              });
-              break;
-
-            case 'unsubscribe':
-              await sharedLogger({
-                service: SERVICE_NAME,
-                level: 'info',
-                message: { type: 'unsubscribe_command', payload },
-              });
-
-              await unsubscribeFromAccount(`${payload.chain_id}:${payload.account}`);
-              break;
-
-            case 'update_config':
-              await sharedLogger({
-                service: SERVICE_NAME,
-                level: 'info',
-                message: { type: 'config_update_command' },
-              });
-
-              await updateAndReloadConfig();
-              await resubscribeAll();
-              break;
-
-            default:
-              await sharedLogger({
-                service: SERVICE_NAME,
-                level: 'warn',
-                message: { type: 'unknown_command', payload },
-              });
-          }
-
+          await processRedisCommand(payload);
           lastId = id;
         }
       }
@@ -98,8 +55,81 @@ async function pollStream(client, lastId = '$') {
   }
 }
 
-export { pollStream };
+export async function processRedisCommand(payload) {
+  switch (payload.action) {
+    case 'subscribe':
+      await sharedLogger({
+        service: SERVICE_NAME,
+        level: 'info',
+        message: { type: 'subscribe_command', payload },
+      });
 
-export function setRunning(value) {
-  running = value;
+      if (payload.priority === true) {
+        try {
+          const { markAccountAsPrioritized } = await import('../queue/perAccountQueueManager.js');
+          markAccountAsPrioritized(payload.chain_id, payload.account);
+
+          await sharedLogger({
+            service: SERVICE_NAME,
+            level: 'info',
+            message: {
+              type: 'subscribe_priority_marked',
+              chain_id: payload.chain_id,
+              account: payload.account,
+            },
+          });
+        } catch (err) {
+          try {
+            await sharedLogger({
+              service: SERVICE_NAME,
+              level: 'error',
+              message: {
+                type: 'subscribe_priority_failed',
+                error: err.message,
+              },
+            });
+          } catch (_) {}
+        }
+      }
+
+      await subscribeToAccount({
+        chain_id: payload.chain_id,
+        account: payload.account,
+        last_signature: payload.last_signature,
+        history_max_age_ms: payload.history_max_age_ms,
+      });
+      break;
+
+    case 'unsubscribe':
+      await sharedLogger({
+        service: SERVICE_NAME,
+        level: 'info',
+        message: { type: 'unsubscribe_command', payload },
+      });
+
+      await unsubscribeFromAccount(`${payload.chain_id}:${payload.account}`);
+      break;
+
+    case 'update_config':
+      await handleUpdateConfigCommand();
+      break;
+
+    default:
+      await sharedLogger({
+        service: SERVICE_NAME,
+        level: 'warn',
+        message: { type: 'unknown_command', payload },
+      });
+  }
+}
+
+export async function handleUpdateConfigCommand() {
+  await sharedLogger({
+    service: SERVICE_NAME,
+    level: 'info',
+    message: { type: 'config_update_command' },
+  });
+
+  await updateAndReloadConfig();
+  await resubscribeAll();
 }

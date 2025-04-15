@@ -1,4 +1,4 @@
-import { createClient } from 'redis';
+import { safeStringify } from './safeStringify.js';
 
 let redis;
 let isConnected = false;
@@ -22,9 +22,16 @@ export async function sharedLogger({ service, level = 'info', message }) {
       message,
     };
 
-    await redis.xAdd(STREAM_KEY, '*', { data: JSON.stringify(logEntry) });
+    let jsonData;
+    try {
+      jsonData = safeStringify(logEntry); // 💡 теперь это можно мокать!
+    } catch (serializationError) {
+      console.warn('[sharedLogger] JSON serialization error:', serializationError.message);
+      return;
+    }
+
+    await redis.xAdd(STREAM_KEY, '*', { data: jsonData });
   } catch (err) {
-    // 👇 Просто молча игнорируем любые ошибки Redis
     console.warn('[sharedLogger] Redis suppressed error:', err.message);
   }
 }

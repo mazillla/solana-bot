@@ -1,19 +1,8 @@
-import { createClient } from 'redis';
-
-let redis;
-let isConnected = false;
+import { getRedisClient } from '../../../utils/redisClientSingleton.js';
 
 export async function redisPublishLog(streamKey, messageObject) {
   try {
-    if (!redis) {
-      redis = createClient({ url: 'redis://redis:6379' });
-    }
-
-    if (!isConnected) {
-      await redis.connect();
-      isConnected = true;
-    }
-
+    const redis = await getRedisClient();
     const payload = JSON.stringify(messageObject);
     await redis.xAdd(streamKey, '*', { data: payload });
   } catch (err) {

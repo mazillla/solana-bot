@@ -1,0 +1,672 @@
+
+/utils/config/env.js:
+// utils/config/env.js
+
+// ✅ ГОТОВ
+
+/**
+ * Получает значение переменной окружения.
+ *
+ * @param {string} key - название переменной (например, "POSTGRES_URL")
+ * @param {Object} options
+ * @param {boolean} options.required - обязательность (по умолчанию true)
+ * @param {*} options.fallback - значение по умолчанию
+ */
+export function getEnvVar(key, { required = true, fallback = undefined } = {}) {
+    const value = process.env[key] ?? fallback;
+  
+    if (required && value === undefined) {
+      console.error(`[env] ❌ Обязательная переменная ${key} не задана и не имеет fallback`);
+      process.exit(1);
+    }
+  
+    return value;
+  }
+  
+
+/utils/config/index.js:
+// utils/config/index.js
+
+// ✅ ГОТОВ
+
+// ✅ Загружаем переменные окружения из .env
+import dotenv from 'dotenv';
+dotenv.config(); // автоматически берёт .env из корня проекта
+
+// 📘 Утилита для безопасного чтения env-переменных
+import { getEnvVar } from './env.js';
+
+// 📋 Схема переменных окружения (POSTGRES_URL, REDIS_URL и т.п.)
+import { envSchema } from './schema.js';
+
+// 📑 Схемы Redis-команд для валидации (subscribe_command, unsubscribe и т.п.)
+import { schemas } from './schemas.js';
+
+/**
+ * ✅ Централизованная конфигурация всего проекта
+ * Используется во всех модулях: логгер, БД, Redis, RedisStreamBus, и т.д.
+ */
+export const CONFIG = {
+  /**
+   * 🔌 PostgreSQL
+   * Пример: postgres://user:pass@postgres:5432/dbname
+   */
+  db: {
+    connectionString: getEnvVar('POSTGRES_URL', envSchema.POSTGRES_URL),
+  },
+
+  /**
+   * 📡 Redis
+   * Пример: redis://localhost:6379
+   */
+  redis: {
+    url: getEnvVar('REDIS_URL', envSchema.REDIS_URL),
+  },
+
+  /**
+   * 📝 Уровень логирования (debug, info, warn, error)
+   */
+  logLevel: getEnvVar('LOG_LEVEL', envSchema.LOG_LEVEL),
+
+  /**
+   * 🌍 Окружение (development, production, test)
+   */
+  environment: getEnvVar('NODE_ENV', envSchema.NODE_ENV),
+
+  /**
+   * 📑 Схемы для валидации Redis-команд
+   * Используются в validateEvent(...) для проверки полей
+   */
+  schemas,
+};
+
+
+/utils/config/schema.js:
+// utils/config/schema.js
+
+// ✅ ГОТОВ
+
+export const envSchema = {
+    POSTGRES_URL: { required: true },
+    REDIS_URL: { required: false, fallback: 'redis://localhost:6379' },
+    LOG_LEVEL: { required: false, fallback: 'info' },
+    NODE_ENV: { required: false, fallback: 'development' },
+  };
+  
+
+/utils/config/schemas.js:
+// utils/config/schemas.js
+
+// ✅ ГОТОВ
+
+export const schemas = {
+    subscribe_command: {
+      fields: ['chain_id', 'account'],
+    },
+    unsubscribe_command: {
+      fields: ['chain_id', 'account'],
+    },
+    config_update_command: {
+      fields: [],
+    }
+  };
+  
+
+/utils/eventSchemas.js:
+// utils/eventSchemas.js
+
+// ✅ ГОТОВ
+
+// 📦 Импорт централизованной конфигурации
+// CONFIG.schemas будет содержать описание всех ожидаемых типов событий и обязательных полей
+import { CONFIG } from './config/index.js';
+
+/**
+ * ✅ Валидация структуры события по схеме
+ *
+ * @param {string} eventName - Название события (например: 'subscribe_command')
+ * @param {object} payload - Объект данных, содержащий поля команды
+ * @returns {{
+ *   valid: boolean,
+ *   missingFields?: string[]
+ * }}
+ *
+ * 💡 Используется для проверки входящих Redis-команд, чтобы убедиться,
+ *     что в payload есть все необходимые поля согласно config.json → schemas
+ */
+export function validateEvent(eventName, payload) {
+  // 🔍 Ищем схему по имени события
+  // (некоторые схемы могут быть в верхнем регистре — поэтому можно привести к нижнему)
+  const schema = CONFIG.schemas?.[eventName];
+
+  // ⚠️ Если схема не найдена — считаем это ошибкой
+  if (!schema) {
+    return {
+      valid: false,
+      missingFields: [`Неизвестная схема для события "${eventName}"`]
+    };
+  }
+
+  // 📋 Извлекаем список обязательных полей из схемы
+  const requiredFields = schema.fields || [];
+
+  // 🔎 Проверяем, какие поля отсутствуют в payload
+  const missingFields = requiredFields.filter(field => !(field in payload));
+
+  // ❌ Если есть пропущенные поля — считаем невалидным
+  if (missingFields.length > 0) {
+    return {
+      valid: false,
+      missingFields
+    };
+  }
+
+  // ✅ Все поля на месте — успех
+  return { valid: true };
+}
+
+
+/utils/heartbeat.js:
+// ✅ ОБНОВЛЁННЫЙ
+
+import os from 'os';
+import { sharedLogger } from './sharedLogger.js';
+import { getCurrentConfig } from '../services/solana_subscriber/config/configLoader.js';
+import { getRedisClient } from './redisClientSingleton.js';
+
+let heartbeatInterval = null;
+
+/**
+ * 🚀 Запускает heartbeat-отправку сообщений в Redis Stream.
+ * 
+ * @param {string} serviceName — Имя текущего сервиса (например: solana_subscriber)
+ */
+export async function startHeartbeat(serviceName) {
+  const instanceId = `${serviceName}@${os.hostname()}:${process.pid}`;
+  let streamKey = 'system_heartbeat';
+  let intervalMs = 30000;
+
+  try {
+    const config = getCurrentConfig();
+    streamKey = config.heartbeat_stream_key || streamKey;
+    intervalMs = config.heartbeat_interval_ms || intervalMs;
+  } catch (err) {
+    try {
+      await sharedLogger({
+        service: serviceName,
+        level: 'warn',
+        message: {
+          type: 'heartbeat_config_missing',
+          error: err.message,
+        },
+      });
+    } catch (_) {}
+  }
+
+  heartbeatInterval = setInterval(async () => {
+    const message = {
+      type: 'HEARTBEAT',
+      service: serviceName,
+      instance_id: instanceId,
+      timestamp: Date.now(),
+    };
+
+    // ✅ Валидация сообщения перед отправкой
+    if (typeof message !== 'object' || message === null) {
+      await sharedLogger({
+        service: serviceName,
+        level: 'warn',
+        message: {
+          type: 'heartbeat_skipped',
+          reason: 'invalid_message_object',
+        },
+      });
+      return;
+    }
+
+    try {
+      const redis = await getRedisClient();
+      await redis.xAdd(streamKey, '*', {
+        data: JSON.stringify(message),
+      });
+
+    } catch (err) {
+      try {
+        await sharedLogger({
+          service: serviceName,
+          level: 'error',
+          message: {
+            type: 'heartbeat_publish_failed',
+            error: err.message,
+          },
+        });
+      } catch (_) {}
+    }
+  }, intervalMs);
+}
+
+/**
+ * 🛑 Останавливает отправку heartbeat-сообщений
+ */
+export async function stopHeartbeat() {
+  if (heartbeatInterval) {
+    clearInterval(heartbeatInterval);
+    heartbeatInterval = null;
+  }
+}
+
+
+/utils/isValidPayload.js:
+// utils/isValidPayload.js
+export function isValidPayload(obj) {
+    return obj !== null && typeof obj === 'object' && !Array.isArray(obj);
+  }
+  
+
+/utils/redisClientSingleton.js:
+// utils/redisClientSingleton.js
+
+// ✅ ГОТОВ (обновлён)
+
+// 📦 Redis-клиент (node-redis v4)
+import { createClient } from 'redis';
+
+// 🧠 Централизованная конфигурация (POSTGRES_URL, REDIS_URL и т.д.)
+import { CONFIG } from './config/index.js';
+
+// 📢 Общий логгер
+import { sharedLogger } from './sharedLogger.js';
+
+// 🔁 Один глобальный клиент на весь процесс
+let redisClient = null;
+let connected = false;
+
+/**
+ * 📡 Возвращает singleton Redis-клиент.
+ * 
+ * Поведение:
+ * - если уже подключён → возвращает его;
+ * - если не создан → создаёт, подключает, логирует;
+ * - при ошибке подключения → выбрасывает исключение.
+ */
+export async function getRedisClient() {
+  if (!redisClient) {
+    redisClient = createClient({ url: CONFIG.redis.url });
+
+    // Подписка на ошибки Redis
+    redisClient.on('error', async (err) => {
+      try {
+        await sharedLogger({
+          service: 'redisClient',
+          level: 'error',
+          message: {
+            type: 'redis_error',
+            error: err.message,
+          },
+        });
+      } catch (_) {}
+    });
+
+    // Подписка на переподключение
+    redisClient.on('reconnecting', async () => {
+      try {
+        await sharedLogger({
+          service: 'redisClient',
+          level: 'warn',
+          message: {
+            type: 'redis_reconnecting',
+          },
+        });
+      } catch (_) {}
+    });
+
+    try {
+      await redisClient.connect(); // 🔌 Подключаемся
+      connected = true;
+
+      // ✅ Лог об успешном подключении
+      await sharedLogger({
+        service: 'redisClient',
+        level: 'info',
+        message: {
+          type: 'redis_connected',
+          url: CONFIG.redis.url,
+        },
+      });
+
+    } catch (err) {
+      connected = false;
+      throw new Error('❌ Не удалось подключиться к Redis: ' + err.message);
+    }
+  }
+
+  return redisClient;
+}
+
+/**
+ * 🛑 Отключает Redis (если он был создан).
+ * Безопасен при повторном вызове.
+ */
+export async function disconnectRedisClient() {
+  if (redisClient) {
+    try {
+      await redisClient.quit(); // 🧹 Закрытие соединения
+
+      await sharedLogger({
+        service: 'redisClient',
+        level: 'info',
+        message: {
+          type: 'redis_disconnected',
+        },
+      });
+
+    } catch (err) {
+      try {
+        await sharedLogger({
+          service: 'redisClient',
+          level: 'warn',
+          message: {
+            type: 'redis_disconnect_failed',
+            error: err.message,
+          },
+        });
+      } catch (_) {}
+    }
+
+    redisClient = null;
+    connected = false;
+  }
+}
+
+
+/utils/redisStreamBus.js:
+// utils/redisStreamBus.js
+
+// 📦 Redis клиент через singleton
+import { getRedisClient } from './redisClientSingleton.js';
+
+// 🧠 Централизованный логгер
+import { sharedLogger } from './sharedLogger.js';
+
+/// ------------------------------------------------------------------------
+/// 🔁 МАРШРУТИЗАЦИЯ ПОТОКОВ И ГРУПП
+/// ------------------------------------------------------------------------
+
+const STREAM_ROUTING = {
+  subscribe_command: 'subscriber_control',
+  unsubscribe_command: 'subscriber_control',
+  config_update_command: 'subscriber_control',
+  transaction_published: 'transaction_stream',
+  subscription_state_changed: 'subscriber_subscription_state',
+};
+
+const GROUP_ROUTING = {
+  subscribe_command: 'subscriber_runtime',
+  unsubscribe_command: 'subscriber_runtime',
+  config_update_command: 'subscriber_runtime',
+  transaction_published: 'analyzer_group',
+  subscription_state_changed: 'ui_state_syncer',
+};
+
+const MAXLEN = 10000;
+const APPROXIMATE = true;
+const initializedGroups = new Set();
+
+/// ------------------------------------------------------------------------
+/// 🧪 Валидация payload перед отправкой
+/// ------------------------------------------------------------------------
+
+function isValidPayload(payload) {
+  return typeof payload === 'object' && payload !== null && !Array.isArray(payload);
+}
+
+/// ------------------------------------------------------------------------
+/// 🧱 Убедиться, что группа существует
+/// ------------------------------------------------------------------------
+
+async function ensureGroupExists({ stream, group, service }) {
+  const redis = await getRedisClient();
+  const groupKey = `${stream}::${group}`;
+  if (initializedGroups.has(groupKey)) return;
+
+  try {
+    await redis.xGroupCreate(stream, group, '$', { MKSTREAM: true });
+  } catch (err) {
+    if (!err?.message?.includes('BUSYGROUP')) {
+      await sharedLogger({
+        service,
+        level: 'error',
+        message: {
+          type: 'stream_group_create_failed',
+          stream,
+          group,
+          error: err.message,
+        },
+      });
+    }
+  }
+
+  initializedGroups.add(groupKey);
+}
+
+/// ------------------------------------------------------------------------
+/// 📤 Публикация события в Redis Stream
+/// ------------------------------------------------------------------------
+
+export async function publishToStream({ service, type, payload, stream, group }) {
+  const resolvedStream = stream || STREAM_ROUTING[type];
+  const resolvedGroup = group || GROUP_ROUTING[type];
+
+  // 🚧 Проверка — известный ли поток и группа
+  if (!resolvedStream || !resolvedGroup) {
+    await sharedLogger({
+      service,
+      level: 'warn',
+      message: {
+        type: 'stream_publish_skipped',
+        reason: 'unknown_type_or_group',
+        input: { type, stream, group },
+      },
+    });
+    return;
+  }
+
+  // 🚧 Проверка — является ли payload валидным объектом
+  if (!isValidPayload(payload)) {
+    await sharedLogger({
+      service,
+      level: 'warn',
+      message: {
+        type: 'stream_publish_skipped',
+        reason: 'invalid_payload',
+        payloadType: typeof payload,
+        type,
+      },
+    });
+    return;
+  }
+
+  // ✅ Убедиться, что группа создана
+  await ensureGroupExists({ stream: resolvedStream, group: resolvedGroup, service });
+
+  const redis = await getRedisClient();
+  const message = {
+    type,
+    service,
+    timestamp: Date.now(),
+    payload,
+  };
+
+  try {
+    await redis.xAdd(resolvedStream, '*', { data: JSON.stringify(message) }, {
+      MAXLEN,
+      approximate: APPROXIMATE,
+    });
+  } catch (err) {
+    await sharedLogger({
+      service,
+      level: 'error',
+      message: {
+        type: 'stream_publish_failed',
+        stream: resolvedStream,
+        group: resolvedGroup,
+        error: err.message,
+      },
+    });
+  }
+}
+
+
+/utils/sharedLogger.js:
+// utils/sharedLogger.js
+
+// ✅ ГОТОВ (обновлён с валидацией)
+
+// 📦 Redis-клиент (node-redis v4)
+import { createClient } from 'redis';
+
+// 🧠 Централизованная конфигурация (POSTGRES_URL, REDIS_URL и др.)
+import { CONFIG } from './config/index.js';
+
+// 🔍 Валидация payload перед логированием
+import { isValidPayload } from './isValidPayload.js'; // 👈 новая утилита
+
+// 🔒 Приватные переменные
+let redis = null;                 // Redis клиент
+let isConnected = false;         // Флаг подключения
+const STREAM_KEY = 'logs:stream'; // Имя Redis Stream, куда пишутся логи
+
+/**
+ * 📢 Централизованный логгер для всех микросервисов
+ *
+ * Отправляет сообщения в Redis Stream `logs:stream`.
+ * Гарантирует, что:
+ * - Redis создаётся один раз
+ * - Лог корректно сериализуется
+ * - В случае ошибок использует fallback
+ *
+ * @param {object} options
+ * @param {string} options.service - имя микросервиса
+ * @param {string} [options.level="info"] - уровень лога (info, warn, error)
+ * @param {object|string} options.message - тело лога (объект или строка)
+ */
+export async function sharedLogger({ service, level = 'info', message }) {
+  try {
+    // ❌ Предотвращаем публикацию пустых / невалидных сообщений
+    if (
+      typeof message !== 'string' &&
+      !isValidPayload(message)
+    ) {
+      await fallbackLogger({
+        service,
+        level: 'warn',
+        message: {
+          type: 'shared_logger_invalid_message',
+          input: message,
+        },
+      });
+      return;
+    }
+
+    // 🔌 Создаём Redis-клиент при первом вызове
+    if (!redis) {
+      redis = createClient({ url: CONFIG.redis.url });
+    }
+
+    // 📡 Подключение (однократное)
+    if (!isConnected) {
+      await redis.connect();
+      isConnected = true;
+    }
+
+    // 🧾 Формируем лог-запись
+    const logEntry = {
+      timestamp: new Date().toISOString(),
+      service,
+      level,
+      message,
+    };
+
+    // 💡 Пробуем сериализовать
+    let jsonData;
+    try {
+      jsonData = JSON.stringify(logEntry);
+    } catch (serializationError) {
+      await fallbackLogger({
+        service,
+        level: 'error',
+        message: {
+          type: 'shared_logger_serialization_failed',
+          error: serializationError.message,
+        },
+      });
+      return;
+    }
+
+    // 🚀 Отправляем в Redis Stream
+    await redis.xAdd(STREAM_KEY, '*', { data: jsonData });
+
+  } catch (err) {
+    // 🛑 Redis недоступен → fallback
+    await fallbackLogger({
+      service,
+      level: 'warn',
+      message: {
+        type: 'shared_logger_redis_failed',
+        error: err.message,
+      },
+    });
+  }
+}
+
+/**
+ * 🛠 Резервный логгер (используется только при сбоях Redis или JSON.stringify)
+ *
+ * Выводит лог в stdout в читаемом виде. Используется только в крайних случаях.
+ */
+async function fallbackLogger({ service, level, message }) {
+  const safeOutput = {
+    timestamp: new Date().toISOString(),
+    service,
+    level,
+    message,
+  };
+
+  console.log(`[fallbackLogger]`, JSON.stringify(safeOutput, null, 2));
+}
+
+
+/utils/sleep.js:
+// utils/sleep.js
+export function sleep(ms) {
+    return new Promise(resolve => setTimeout(resolve, ms));
+  }
+  
+
+/utils/withAbortTimeout.js:
+// utils/withAbortTimeout.js
+
+// ✅ ГОТОВ
+
+/**
+ * ⏱ Выполняет асинхронную операцию с таймаутом.
+ * 
+ * 💡 Использует AbortController, но не требует поддержки сигнала в callback.
+ * Просто завершает выполнение по таймеру, если callback не успел.
+ *
+ * @param {function(AbortSignal): Promise<any>} promiseFn - функция, принимающая signal (можно игнорировать)
+ * @param {number} timeoutMs - сколько ждать (в миллисекундах)
+ * @returns {Promise<any>} результат promiseFn или ошибка AbortError
+ */
+export function withAbortTimeout(promiseFn, timeoutMs = 5000) {
+  const controller = new AbortController();
+
+  const timeout = setTimeout(() => {
+    controller.abort(); // 💣 прерываем выполнение по таймауту
+  }, timeoutMs);
+
+  // Возвращаем выполнение, завершая по таймеру
+  return promiseFn(controller.signal)
+    .finally(() => clearTimeout(timeout)); // 💧 очищаем таймер
+}
+

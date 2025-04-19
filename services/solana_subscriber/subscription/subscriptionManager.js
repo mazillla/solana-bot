@@ -1,37 +1,118 @@
 // services/solana_subscriber/subscription/subscriptionManager.js
-import { getAvailableRpc } from '../rpc/rpcPoolCore.js';
+
+// ✅ ГОТОВ
+
+/**
+ * 📡 Модуль управления подписками на аккаунты Solana.
+ *
+ * Выполняет:
+ * - запуск новых подписок
+ * - остановку подписок
+ * - восстановление истории
+ * - буферизацию логов, полученных до завершения восстановления
+ */
+
+import { getAvailableRpc } from '../rpc/rpcPool.js';
 import { sharedLogger } from '../../../utils/sharedLogger.js';
 import { handleLogEvent } from './onLogsHandler.js';
 import { recoverTransactions } from './recoveryManager.js';
-import { getLastSignatureForAccount } from '../db/subscriptions.js';
-import { isPrioritized } from '../queue/perAccountQueueManager.js';
-import { sendSubscriptionStateUpdate } from '../utils/subscriptionStatePublisher.js'; // 💡 создадим этот файл
 
-const SERVICE_NAME = 'solana_subscriber';
-const activeSubscriptions = new Map(); // key: `${chain_id}:${account}`
+import {
+  getLastSignatureForAccount,
+  upsertSubscription,
+  deactivateSubscription,
+} from '../db/subscriptions.js';
 
-globalThis.__mockedSubscribeToAccount = null;
+import {
+  isPrioritized,
+  markAccountAsPrioritized,
+} from '../queue/perAccountPublishQueueManager.js';
 
+import { sendSubscriptionStateUpdate } from '../utils/subscriptionStatePublisher.js';
+import { getCurrentConfig } from '../config/configLoader.js';
+
+// Активные подписки: key = `${chain_id}:${account}` → {...}
+const activeSubscriptions = new Map();
+
+// Флаги восстановления
+const recoveryInProgress = new Map();
+
+// Буфер логов, пришедших до восстановления
+const bufferedSignatures = new Map();
+
+/**
+ * 🔁 Старт всех подписок из БД
+ */
 export async function startAllSubscriptions(subscriptionList) {
   for (const sub of subscriptionList) {
-    await subscribeToAccount(sub);
+    await subscribeToAccount({
+      chain_id: sub.chain_id,
+      account: sub.account,
+      last_signature: sub.last_signature,
+      priority: sub.priority === true,
+    });
   }
 }
 
+/**
+ * ⛔ Завершение всех подписок
+ */
 export async function stopAllSubscriptions() {
   for (const key of activeSubscriptions.keys()) {
     await unsubscribeFromAccount(key);
   }
 }
 
-export async function subscribeToAccount({ chain_id, account, last_signature = null, history_max_age_ms = null }) {
+/**
+ * 📥 Подписка на конкретный аккаунт
+ */
+export async function subscribeToAccount({
+  chain_id,
+  account,
+  last_signature = null,
+  history_max_age_ms,
+  priority = false,
+}) {
   const key = `${chain_id}:${account}`;
+
   if (activeSubscriptions.has(key)) return;
 
+  // Если приоритет — сразу активируем воркер
+  if (priority === true) {
+    markAccountAsPrioritized(chain_id, account);
+  }
+
+  const configHistoryMaxAge = getCurrentConfig().default_history_max_age_ms;
+  const effectiveHistoryAge = history_max_age_ms || configHistoryMaxAge;
+
+  // ⏺️ Запись в БД
+  try {
+    await upsertSubscription({
+      chain_id,
+      account,
+      last_signature,
+      history_max_age_ms: effectiveHistoryAge,
+      priority,
+    });
+  } catch (err) {
+    await sharedLogger({
+      service: getCurrentConfig().service_name,
+      level: 'error',
+      message: {
+        type: 'upsert_subscription_failed',
+        chain_id,
+        account,
+        error: err.message,
+      },
+    });
+    return;
+  }
+
+  // 🌐 RPC WebSocket
   const rpc = await getAvailableRpc();
   if (!rpc) {
     await sharedLogger({
-      service: SERVICE_NAME,
+      service: getCurrentConfig().service_name,
       level: 'warn',
       message: {
         type: 'subscribe_skipped',
@@ -43,44 +124,51 @@ export async function subscribeToAccount({ chain_id, account, last_signature = n
     return;
   }
 
+  // 🧾 Последняя сигнатура
   if (!last_signature) {
     last_signature = await getLastSignatureForAccount(chain_id, account);
   }
 
-  // ✅ восстановление
-  await recoverTransactions({
-    chain_id,
-    account,
-    last_signature,
-    history_max_age_ms,
-  });
+  recoveryInProgress.set(key, true);
+  bufferedSignatures.set(key, []);
 
-  // ▶️ подписка
+  // 🔔 Подписка на логи
   const id = rpc.wsConn.onLogs(account, async (logInfo) => {
-    if (!logInfo?.signature || logInfo.err) return;
-    await handleLogEvent({ chain_id, account, signature: logInfo.signature });
+    if (!logInfo?.signature) return;
+    const signature = logInfo.signature;
+
+    if (recoveryInProgress.has(key)) {
+      bufferedSignatures.get(key).push(signature);
+    } else {
+      await handleLogEvent({ chain_id, account, signature, rpc });
+    }
   });
 
+  // 💾 Регистрируем подписку
   activeSubscriptions.set(key, {
     chain_id,
     account,
     rpc_id: rpc.id,
     subscriptionId: id,
     wsConn: rpc.wsConn,
+    last_signature,
+    history_max_age_ms: effectiveHistoryAge,
   });
 
+  // 📢 Лог
   await sharedLogger({
-    service: SERVICE_NAME,
+    service: getCurrentConfig().service_name,
     level: 'info',
     message: {
       type: 'subscribe',
       chain_id,
       account,
       rpc_id: rpc.id,
+      priority,
     },
   });
 
-  // ✅ статус connected: true
+  // 📡 Redis
   try {
     await sendSubscriptionStateUpdate({
       chain_id,
@@ -89,8 +177,52 @@ export async function subscribeToAccount({ chain_id, account, last_signature = n
       connected: true,
     });
   } catch (_) {}
+
+  // ⏮️ Восстановление
+  try {
+    await recoverTransactions({
+      chain_id,
+      account,
+      last_signature,
+      history_max_age_ms: effectiveHistoryAge,
+    });
+  } catch (err) {
+    await sharedLogger({
+      service: getCurrentConfig().service_name,
+      level: 'error',
+      message: {
+        type: 'recovery_failed',
+        chain_id,
+        account,
+        error: err.message,
+      },
+    });
+  }
+
+  // 📦 Обработка буфера
+  const buffer = bufferedSignatures.get(key) || [];
+  for (const signature of buffer) {
+    await handleLogEvent({ chain_id, account, signature, rpc });
+  }
+
+  recoveryInProgress.delete(key);
+  bufferedSignatures.delete(key);
+
+  await sharedLogger({
+    service: getCurrentConfig().service_name,
+    level: 'info',
+    message: {
+      type: 'recovery_finished',
+      chain_id,
+      account,
+      buffered_signatures: buffer.length,
+    },
+  });
 }
 
+/**
+ * ❌ Отписка от аккаунта
+ */
 export async function unsubscribeFromAccount(key) {
   const sub = activeSubscriptions.get(key);
   if (!sub) return;
@@ -99,7 +231,7 @@ export async function unsubscribeFromAccount(key) {
     await sub.wsConn.removeOnLogsListener(sub.subscriptionId);
   } catch (err) {
     await sharedLogger({
-      service: SERVICE_NAME,
+      service: getCurrentConfig().service_name,
       level: 'warn',
       message: {
         type: 'unsubscribe_failed',
@@ -112,8 +244,10 @@ export async function unsubscribeFromAccount(key) {
   activeSubscriptions.delete(key);
 
   const [chain_id, account] = key.split(':');
+  await deactivateSubscription({ chain_id, account });
+
   await sharedLogger({
-    service: SERVICE_NAME,
+    service: getCurrentConfig().service_name,
     level: 'info',
     message: {
       type: 'unsubscribe',
@@ -123,7 +257,6 @@ export async function unsubscribeFromAccount(key) {
     },
   });
 
-  // ✅ статус connected: false
   try {
     await sendSubscriptionStateUpdate({
       chain_id,
@@ -134,31 +267,53 @@ export async function unsubscribeFromAccount(key) {
   } catch (_) {}
 }
 
+/**
+ * ♻️ Повторная подписка на все аккаунты
+ */
 export async function resubscribeAll() {
-  const oldSubs = Array.from(activeSubscriptions.values());
+  const oldSubs = Array.from(activeSubscriptions.entries());
+
   await stopAllSubscriptions();
+  await publishAllDisconnected();
 
-  await publishAllDisconnected(); // 👈 перед восстановлением
+  for (const [key, sub] of oldSubs) {
+    const { chain_id, account, last_signature } = sub;
 
-  for (const sub of oldSubs) {
-    await (globalThis.__mockedSubscribeToAccount || subscribeToAccount)({
-      chain_id: sub.chain_id,
-      account: sub.account,
-    });
+    try {
+      await subscribeToAccount({
+        chain_id,
+        account,
+        last_signature,
+        priority: sub.priority === true,
+      });
 
-    await sharedLogger({
-      service: SERVICE_NAME,
-      level: 'info',
-      message: {
-        type: 'resubscribe',
-        chain_id: sub.chain_id,
-        account: sub.account,
-      },
-    });
+      await sharedLogger({
+        service: getCurrentConfig().service_name,
+        level: 'info',
+        message: {
+          type: 'resubscribe',
+          chain_id,
+          account,
+        },
+      });
+    } catch (err) {
+      await sharedLogger({
+        service: getCurrentConfig().service_name,
+        level: 'error',
+        message: {
+          type: 'resubscribe_failed',
+          chain_id,
+          account,
+          error: err.message,
+        },
+      });
+    }
   }
 }
 
-// 🔔 Вызывается при handleDisconnect
+/**
+ * 🔄 Уведомление об отключении всех подписок
+ */
 export async function publishAllDisconnected() {
   for (const key of activeSubscriptions.keys()) {
     const [chain_id, account] = key.split(':');
@@ -172,6 +327,3 @@ export async function publishAllDisconnected() {
     } catch (_) {}
   }
 }
-
-// экспорт для тестов
-export const __activeSubscriptions = activeSubscriptions;

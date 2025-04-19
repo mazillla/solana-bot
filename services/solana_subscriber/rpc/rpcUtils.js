@@ -1,23 +1,43 @@
+// services/solana_subscriber/rpc/rpcUtils.js
+
+// ✅ ГОТОВ
+
+/**
+ * 📦 Утилиты для безопасной работы с Solana RPC через web3.js
+ *
+ * 💡 Возможности:
+ * - ограничение по времени (таймаут)
+ * - логгирование RPC ошибок (с указанием метода и rpc_id)
+ * - поддержка кастомного `commitment` (только в getParsedTransaction)
+ */
+
 import { getCurrentConfig } from '../config/configLoader.js';
 import { sharedLogger } from '../../../utils/sharedLogger.js';
 import { withAbortTimeout } from '../../../utils/withAbortTimeout.js';
 
-const SERVICE_NAME = 'solana_subscriber';
-
+/**
+ * 🔍 Получает `ParsedTransaction` по сигнатуре с таймаутом и логгированием.
+ *
+ * @param {object} rpc - объект RPC из пула (httpConn, id и т.д.)
+ * @param {string} signature - сигнатура транзакции (txid)
+ * @returns {Promise<ParsedTransaction | null>}
+ */
 export async function getParsedTransactionWithTimeout(rpc, signature) {
-  const timeoutMs = getCurrentConfig().rpc_timeout_ms || 5000;
+  const config = getCurrentConfig();
+  const timeoutMs = config.rpc_timeout_ms || 5000;
+  const commitment = config.commitment || 'confirmed';
 
   try {
     return await withAbortTimeout(async (_signal) => {
       return await rpc.httpConn.getParsedTransaction(signature, {
-        commitment: 'confirmed',
+        commitment,
         maxSupportedTransactionVersion: 0,
       });
     }, timeoutMs);
   } catch (err) {
     try {
       await sharedLogger({
-        service: SERVICE_NAME,
+        service: config.service_name,
         level: 'warn',
         message: {
           type: 'rpc_timeout',
@@ -32,8 +52,17 @@ export async function getParsedTransactionWithTimeout(rpc, signature) {
   }
 }
 
+/**
+ * 📜 Получает список сигнатур для заданного адреса аккаунта (с таймаутом).
+ *
+ * @param {object} rpc - RPC-клиент из пула
+ * @param {string | PublicKey} address - адрес аккаунта
+ * @param {object} options - параметры запроса: { limit, before, until }
+ * @returns {Promise<Array<ConfirmedSignatureInfo> | null>}
+ */
 export async function getSignaturesForAddressWithTimeout(rpc, address, options = {}) {
-  const timeoutMs = getCurrentConfig().rpc_timeout_ms || 5000;
+  const config = getCurrentConfig();
+  const timeoutMs = config.rpc_timeout_ms || 5000;
 
   try {
     return await withAbortTimeout(async (_signal) => {
@@ -42,7 +71,7 @@ export async function getSignaturesForAddressWithTimeout(rpc, address, options =
   } catch (err) {
     try {
       await sharedLogger({
-        service: SERVICE_NAME,
+        service: config.service_name,
         level: 'warn',
         message: {
           type: 'rpc_timeout',

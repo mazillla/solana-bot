@@ -1,15 +1,39 @@
+// services/solana_subscriber/queue/perAccountPublishQueueManager.js
+
+// ✅ ГОТОВ
+
+/**
+ * 🧩 Модуль для обработки приоритетных аккаунтов.
+ * Для каждого приоритетного аккаунта создаётся отдельная очередь и воркер.
+ * Это позволяет:
+ * - обходить лимиты
+ * - изолировать обработку от общей очереди
+ * - давать "VIP" аккаунтам ускоренную обработку
+ */
+
 import { getParsedTransactionWithTimeout } from '../rpc/rpcUtils.js';
 import { enqueueTransaction } from './publishQueue.js';
 import { getCurrentConfig } from '../config/configLoader.js';
 import { sharedLogger } from '../../../utils/sharedLogger.js';
 import { sleep } from '../../../utils/sleep.js';
 
-const SERVICE_NAME = 'solana_subscriber_perAccountQueue';
-
+// 📌 Аккаунты с приоритетной обработкой
 const prioritizedAccounts = new Set(); // key = `${chain_id}:${account}`
-const accountQueues = new Map();       // key = `${chain_id}:${account}` → [{...}]
-const isRunningMap = new Map();        // key = `${chain_id}:${account}` → boolean
 
+// 📦 Очереди задач по каждому приоритетному аккаунту
+const accountQueues = new Map();       // key → [{...}]
+
+// 🌀 Состояния воркеров (запущен или нет)
+const isRunningMap = new Map();        // key → boolean
+
+// 🔔 Промисы ожидания новой задачи по аккаунту
+const queueResolvers = new Map();      // key → resolver (будильник)
+const queueWaiters = new Map();        // key → Promise (ожидание новой задачи)
+
+/**
+ * ✅ Отметить аккаунт как приоритетный.
+ * Создаёт очередь и воркер, если они ещё не существуют.
+ */
 export function markAccountAsPrioritized(chain_id, account) {
   const key = `${chain_id}:${account}`;
   prioritizedAccounts.add(key);
@@ -17,15 +41,25 @@ export function markAccountAsPrioritized(chain_id, account) {
   if (!accountQueues.has(key)) {
     accountQueues.set(key, []);
     isRunningMap.set(key, false);
+
+    // инициализируем механизм ожидания
+    queueWaiters.set(key, new Promise(res => queueResolvers.set(key, res)));
+
     startPerAccountWorker(chain_id, account);
   }
 }
 
+/**
+ * 🔍 Проверяет, является ли аккаунт приоритетным
+ */
 export function isPrioritized(chain_id, account) {
   return prioritizedAccounts.has(`${chain_id}:${account}`);
 }
 
-export function enqueueToPerAccountQueue(task) {
+/**
+ * 📥 Добавить задачу в очередь приоритетного аккаунта
+ */
+export function enqueueToPerAccountPublishQueue(task) {
   const key = `${task.chain_id}:${task.account}`;
   const queue = accountQueues.get(key);
   if (!queue) return;
@@ -35,8 +69,19 @@ export function enqueueToPerAccountQueue(task) {
   }
 
   queue.push(task);
+
+  // 🛎️ Будим воркер, если он ждёт
+  const resolver = queueResolvers.get(key);
+  if (resolver) {
+    resolver();
+    queueResolvers.set(key, null);
+    queueWaiters.set(key, new Promise(res => queueResolvers.set(key, res)));
+  }
 }
 
+/**
+ * 🚀 Запуск воркера для одного аккаунта
+ */
 function startPerAccountWorker(chain_id, account) {
   const key = `${chain_id}:${account}`;
   if (isRunningMap.get(key)) return;
@@ -49,8 +94,9 @@ function startPerAccountWorker(chain_id, account) {
     while (true) {
       const task = queue.shift();
 
+      // 💤 Если очередь пуста — ждём новую задачу
       if (!task) {
-        await sleep(200);
+        await queueWaiters.get(key);
         continue;
       }
 
@@ -58,7 +104,7 @@ function startPerAccountWorker(chain_id, account) {
       if (now - task.enqueuedAt > maxAge) {
         try {
           await sharedLogger({
-            service: SERVICE_NAME,
+            service: getCurrentConfig().service_name,
             level: 'warn',
             message: {
               type: 'unresolved_transaction_priority',
@@ -108,7 +154,7 @@ function startPerAccountWorker(chain_id, account) {
         queue.push(task);
         try {
           await sharedLogger({
-            service: SERVICE_NAME,
+            service: getCurrentConfig().service_name,
             level: 'error',
             message: {
               type: 'priority_worker_failed',
@@ -123,5 +169,3 @@ function startPerAccountWorker(chain_id, account) {
     }
   })();
 }
-
-

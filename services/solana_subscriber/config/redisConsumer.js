@@ -1,72 +1,113 @@
 // services/solana_subscriber/config/redisConsumer.js
-import { getRedisClient } from '../../../utils/redisClientSingleton.js';
-import { subscribeToAccount, unsubscribeFromAccount, resubscribeAll } from '../subscription/subscriptionManager.js';
+
+// ✅ ГОТОВ
+
+// 📦 Работа с Redis Stream: подписка, ack, восстановление отложенных сообщений
+import {
+  consumeFromStream,
+  ackMessage,
+  recoverAllPendingMessages,
+} from '../../../utils/redisStreamBus.js';
+
+// ⚙️ Управление подписками
+import {
+  subscribeToAccount,
+  unsubscribeFromAccount,
+  resubscribeAll,
+} from '../subscription/subscriptionManager.js';
+
+// 🔁 Перезагрузка конфигурации из БД
 import { updateAndReloadConfig } from './configLoader.js';
+
+// 📢 Общий логгер
 import { sharedLogger } from '../../../utils/sharedLogger.js';
+import { getCurrentConfig } from './configLoader.js';
 
-const SERVICE_NAME = 'solana_subscriber';
-const REDIS_STREAM_KEY = 'subscriber_control';
-let redisClient;
-let running = false;
+// ⚙️ Очереди
+import {
+  stopParseQueueWorker,
+  startParseQueueWorker
+} from '../queue/parseQueue.js';
 
+// ✅ Валидация payload
+import { validateEvent } from '../../../utils/eventSchemas.js';
+
+const SERVICE_NAME = getCurrentConfig().service_name;
+
+/**
+ * 🚀 Запускает Redis Consumer:
+ * - восстанавливает pending
+ * - запускает основную подписку
+ */
 export async function startRedisConsumer() {
-  redisClient = await getRedisClient();
-  running = true;
-  pollStream(redisClient);
-}
-
-export async function stopRedisConsumer() {
-  running = false;
-  // Закрытие redisClient теперь централизованное через shutdown()
-}
-
-export function setRunning(value) {
-  running = value;
-}
-
-export async function pollStream(client, lastId = '$') {
-  while (running) {
-    try {
-      const response = await client.xRead(
-        { key: REDIS_STREAM_KEY, id: lastId },
-        { BLOCK: 5000, COUNT: 10 }
-      );
-
-      if (!response) continue;
-
-      for (const stream of response) {
-        for (const [id, entry] of stream.messages) {
-          const payload = JSON.parse(entry.data.data);
-          await processRedisCommand(payload);
-          lastId = id;
-        }
-      }
-    } catch (err) {
-      await sharedLogger({
-        service: SERVICE_NAME,
-        level: 'error',
-        message: {
-          type: 'redis_consumer_error',
-          error: err.message,
-        },
-      });
-      await new Promise(r => setTimeout(r, 2000));
+  // 🔁 Восстановление отложенных сообщений
+  await recoverAllPendingMessages({
+    consumer: SERVICE_NAME,
+    maxPerStream: 1000,
+    handler: async ({ type, payload }, meta) => {
+      await processRedisCommand(type, payload);
+      await ackMessage({ type, id: meta.id, serviceName: SERVICE_NAME });
     }
+  });
+
+  // 📡 Подписка на каждый тип команд (все три поддерживаемых)
+  const commandTypes = ['subscribe_command', 'unsubscribe_command', 'config_update_command'];
+
+  for (const type of commandTypes) {
+    await consumeFromStream({
+      type,
+      consumer: SERVICE_NAME,
+      handler: async ({ type, payload }, meta) => {
+        await processRedisCommand(type, payload);
+        await ackMessage({ type, id: meta.id, serviceName: SERVICE_NAME });
+      }
+    });
   }
 }
 
-export async function processRedisCommand(payload) {
-  switch (payload.action) {
-    case 'subscribe':
-      await sharedLogger({
-        service: SERVICE_NAME,
-        level: 'info',
-        message: { type: 'subscribe_command', payload },
-      });
+/**
+ * 🛑 Заглушка на будущее
+ */
+export async function stopRedisConsumer() {
+  // 🔕
+}
 
+/**
+ * 🧠 Обработка одной команды из Redis Stream
+ */
+async function processRedisCommand(type, payload) {
+  // ✅ Валидация payload по схеме
+  const { valid, missingFields } = validateEvent(type, payload);
+
+  if (!valid) {
+    await sharedLogger({
+      service: SERVICE_NAME,
+      level: 'warn',
+      message: {
+        type: 'invalid_payload',
+        event: type,
+        missingFields,
+        payload,
+      },
+    });
+    return;
+  }
+
+  // 📥 Лог: команда получена
+  await sharedLogger({
+    service: SERVICE_NAME,
+    level: 'info',
+    message: { type: `${type}_received`, payload },
+  });
+
+  switch (type) {
+    /**
+     * 📌 Подписка на аккаунт
+     */
+    case 'subscribe_command':
       if (payload.priority === true) {
         try {
-          const { markAccountAsPrioritized } = await import('../queue/perAccountQueueManager.js');
+          const { markAccountAsPrioritized } = await import('../queue/perAccountPublishQueueManager.js');
           markAccountAsPrioritized(payload.chain_id, payload.account);
 
           await sharedLogger({
@@ -79,16 +120,14 @@ export async function processRedisCommand(payload) {
             },
           });
         } catch (err) {
-          try {
-            await sharedLogger({
-              service: SERVICE_NAME,
-              level: 'error',
-              message: {
-                type: 'subscribe_priority_failed',
-                error: err.message,
-              },
-            });
-          } catch (_) {}
+          await sharedLogger({
+            service: SERVICE_NAME,
+            level: 'error',
+            message: {
+              type: 'subscribe_priority_failed',
+              error: err.message,
+            },
+          });
         }
       }
 
@@ -97,39 +136,68 @@ export async function processRedisCommand(payload) {
         account: payload.account,
         last_signature: payload.last_signature,
         history_max_age_ms: payload.history_max_age_ms,
+        priority: payload.priority === true,
       });
       break;
 
-    case 'unsubscribe':
-      await sharedLogger({
-        service: SERVICE_NAME,
-        level: 'info',
-        message: { type: 'unsubscribe_command', payload },
-      });
-
+    /**
+     * 🛑 Отписка от аккаунта
+     */
+    case 'unsubscribe_command':
       await unsubscribeFromAccount(`${payload.chain_id}:${payload.account}`);
       break;
 
-    case 'update_config':
-      await handleUpdateConfigCommand();
+    /**
+     * 🔄 Обновление конфигурации
+     * Обновляет только нужные модули
+     */
+    case 'config_update_command': {
+      const { old, updated } = await updateAndReloadConfig();
+
+      if (old.silence_threshold_ms !== updated.silence_threshold_ms) {
+        await sharedLogger({
+          service: updated.service_name,
+          level: 'info',
+          message: {
+            type: 'silence_threshold_updated',
+            from: old.silence_threshold_ms,
+            to: updated.silence_threshold_ms,
+          },
+        });
+      }
+
+      if (old.parse_concurrency !== updated.parse_concurrency) {
+        stopParseQueueWorker();
+        startParseQueueWorker();
+
+        await sharedLogger({
+          service: updated.service_name,
+          level: 'info',
+          message: {
+            type: 'parse_queue_concurrency_updated',
+            from: old.parse_concurrency,
+            to: updated.parse_concurrency,
+          },
+        });
+      }
+
+      const controlsChanged = JSON.stringify(old.control_accounts) !== JSON.stringify(updated.control_accounts);
+
+      if (controlsChanged) {
+        await resubscribeAll();
+
+        await sharedLogger({
+          service: updated.service_name,
+          level: 'info',
+          message: {
+            type: 'control_accounts_updated',
+            old: old.control_accounts,
+            new: updated.control_accounts,
+          },
+        });
+      }
+
       break;
-
-    default:
-      await sharedLogger({
-        service: SERVICE_NAME,
-        level: 'warn',
-        message: { type: 'unknown_command', payload },
-      });
+    }
   }
-}
-
-export async function handleUpdateConfigCommand() {
-  await sharedLogger({
-    service: SERVICE_NAME,
-    level: 'info',
-    message: { type: 'config_update_command' },
-  });
-
-  await updateAndReloadConfig();
-  await resubscribeAll();
 }

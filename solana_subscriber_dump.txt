@@ -1,23 +1,81 @@
 
 /services/solana_subscriber/config/configLoader.js:
-import { getSubscriberConfigFromDb } from '../db/subscriberConfig.js'; // Убедитесь, что импорт правильный
+// services/solana_subscriber/config/configLoader.js
+
+// ✅ ГОТОВ (с валидацией)
+
+import { getSubscriberConfigFromDb } from '../db/subscriberConfig.js';
 import { sharedLogger } from '../../../utils/sharedLogger.js';
+import { validateConfig } from './validateConfig.js'; // 🆕 Импорт валидатора
 
 let currentConfig = null;
-const SERVICE_NAME = 'solana_subscriber';
 
+/**
+ * 📥 Загружает конфигурацию подписчика из таблицы subscriber_config.
+ * Сохраняет результат в переменную `currentConfig`, доступную во всём микросервисе.
+ * 
+ * Используется:
+ * - при старте сервиса
+ * - при обновлении по Redis-команде config_update_command
+ */
 export async function loadSubscriberConfig() {
-  currentConfig = await getSubscriberConfigFromDb(); // Эта функция должна быть замокана в тестах
+  const raw = await getSubscriberConfigFromDb();
 
-  await sharedLogger({
-    service: SERVICE_NAME,
-    level: 'info',
-    message: '🔄 Конфигурация загружена из БД',
+  // 🧪 Проверка: валидный объект
+  if (!raw || typeof raw !== 'object') {
+    throw new Error('Загруженная конфигурация из БД пуста или некорректна');
+  }
+
+  // 🧪 Валидация полной конфигурации (через validateConfig.js)
+  const { valid, errors } = validateConfig(raw);
+  if (!valid) {
+    await sharedLogger({
+      service: raw.service_name || 'solana_subscriber',
+      level: 'error',
+      message: {
+        type: 'config_validation_failed',
+        errors,
+      },
+    });
+    throw new Error('Конфигурация из БД не прошла валидацию');
+  }
+
+  // 🧠 Сохраняем замороженный (immutable) объект
+  currentConfig = Object.freeze({
+    parse_concurrency: raw.parse_concurrency || 3,
+    max_parse_duration_ms: raw.max_parse_duration_ms || 86400000,
+    heartbeat_interval_ms: raw.heartbeat_interval_ms || 30000,
+    rpc_endpoints: raw.rpc_endpoints || [],
+    control_accounts: raw.control_accounts || [],
+    silence_threshold_ms: raw.silence_threshold_ms || 30000,
+    queue_max_length: raw.queue_max_length || 1000,
+    rpc_timeout_ms: raw.rpc_timeout_ms || 5000,
+    default_history_max_age_ms: raw.default_history_max_age_ms || 604800000,
+    recovery_cooldown_ms: raw.recovery_cooldown_ms || 60000,
+    service_name: raw.service_name || 'solana_subscriber',
+    stream_subscription_state: raw.stream_subscription_state || 'subscriber_subscription_state',
+    heartbeat_stream_key: raw.heartbeat_stream_key || 'system_heartbeat',
+    commitment: raw.commitment || 'confirmed',
+    subscription_verifier_interval_ms: raw.subscription_verifier_interval_ms || 60000,
+    recovery_max_age_ms: raw.recovery_max_age_ms || 300000,
+    configVersion: raw.updated_at || new Date().toISOString(), // 💾 можно логировать версию
   });
+
+  try {
+    await sharedLogger({
+      service: currentConfig.service_name,
+      level: 'info',
+      message: '🔄 Конфигурация успешно загружена из БД',
+    });
+  } catch (_) {}
 
   return currentConfig;
 }
 
+/**
+ * 💡 Возвращает текущую загруженную конфигурацию.
+ * Бросает ошибку, если конфигурация не была загружена.
+ */
 export function getCurrentConfig() {
   if (!currentConfig) {
     throw new Error('Конфигурация ещё не загружена. Используй loadSubscriberConfig() сначала.');
@@ -25,201 +83,557 @@ export function getCurrentConfig() {
   return currentConfig;
 }
 
+/**
+ * 🧪 Проверка: загружена ли уже конфигурация
+ * Можно использовать в health-чек или для диагностики
+ */
+export function isConfigLoaded() {
+  return !!currentConfig;
+}
+
+/**
+ * 🔄 Повторно загружает конфигурацию из БД.
+ * Возвращает { old, updated } — для сравнения и принятия решений.
+ */
 export async function updateAndReloadConfig() {
-  currentConfig = await getSubscriberConfigFromDb(); // Замена должна быть здесь
+  const old = currentConfig;
+  const updated = await loadSubscriberConfig();
 
-  await sharedLogger({
-    service: SERVICE_NAME,
-    level: 'info',
-    message: '♻️ Конфигурация обновлена из БД по команде update_config',
-  });
+  try {
+    await sharedLogger({
+      service: updated.service_name,
+      level: 'info',
+      message: '♻️ Конфигурация обновлена из БД по команде update_config',
+    });
+  } catch (_) {}
 
-  return currentConfig;
+  return { old, updated };
 }
 
 
 /services/solana_subscriber/config/redisConsumer.js:
 // services/solana_subscriber/config/redisConsumer.js
-import { createClient } from 'redis';
-import { subscribeToAccount, unsubscribeFromAccount, resubscribeAll } from '../subscription/subscriptionManager.js';
+
+// ✅ ГОТОВ
+
+// 📦 Работа с Redis Stream: подписка, ack, восстановление отложенных сообщений
+import {
+  consumeFromStream,
+  ackMessage,
+  recoverAllPendingMessages,
+} from '../../../utils/redisStreamBus.js';
+
+// ⚙️ Управление подписками
+import {
+  subscribeToAccount,
+  unsubscribeFromAccount,
+  resubscribeAll,
+} from '../subscription/subscriptionManager.js';
+
+// 🔁 Перезагрузка конфигурации из БД
 import { updateAndReloadConfig } from './configLoader.js';
+
+// 📢 Общий логгер
 import { sharedLogger } from '../../../utils/sharedLogger.js';
+import { getCurrentConfig } from './configLoader.js';
 
-const SERVICE_NAME = 'solana_subscriber';
-const REDIS_STREAM_KEY = 'subscriber_control';
-let redisClient;
-let running = false;
+// ⚙️ Очереди
+import {
+  stopParseQueueWorker,
+  startParseQueueWorker
+} from '../queue/parseQueue.js';
 
+// ✅ Валидация payload
+import { validateEvent } from '../../../utils/eventSchemas.js';
+
+const SERVICE_NAME = getCurrentConfig().service_name;
+
+/**
+ * 🚀 Запускает Redis Consumer:
+ * - восстанавливает pending
+ * - запускает основную подписку
+ */
 export async function startRedisConsumer() {
-  redisClient = createClient({ url: 'redis://redis:6379' });
-  await redisClient.connect();
-  running = true;
-  pollStream(redisClient);
-}
-
-export async function stopRedisConsumer() {
-  running = false;
-  if (redisClient) await redisClient.quit();
-}
-
-export function setRunning(value) {
-  running = value;
-}
-
-export async function pollStream(client, lastId = '$') {
-  while (running) {
-    try {
-      const response = await client.xRead(
-        { key: REDIS_STREAM_KEY, id: lastId },
-        { BLOCK: 5000, COUNT: 10 }
-      );
-
-      if (!response) {
-        continue;
-      }
-
-      for (const stream of response) {
-        for (const [id, entry] of stream.messages) {
-          const payload = JSON.parse(entry.data.data);
-          await processRedisCommand(payload);
-          lastId = id;
-        }
-      }
-    } catch (err) {
-      await sharedLogger({
-        service: SERVICE_NAME,
-        level: 'error',
-        message: {
-          type: 'redis_consumer_error',
-          error: err.message,
-        },
-      });
-      await new Promise(r => setTimeout(r, 2000));
+  // 🔁 Восстановление отложенных сообщений
+  await recoverAllPendingMessages({
+    consumer: SERVICE_NAME,
+    maxPerStream: 1000,
+    handler: async ({ type, payload }, meta) => {
+      await processRedisCommand(type, payload);
+      await ackMessage({ type, id: meta.id, serviceName: SERVICE_NAME });
     }
+  });
+
+  // 📡 Подписка на каждый тип команд (все три поддерживаемых)
+  const commandTypes = ['subscribe_command', 'unsubscribe_command', 'config_update_command'];
+
+  for (const type of commandTypes) {
+    await consumeFromStream({
+      type,
+      consumer: SERVICE_NAME,
+      handler: async ({ type, payload }, meta) => {
+        await processRedisCommand(type, payload);
+        await ackMessage({ type, id: meta.id, serviceName: SERVICE_NAME });
+      }
+    });
   }
 }
 
-// 🧠 Новый выделенный обработчик одной команды
-export async function processRedisCommand(payload) {
-  switch (payload.action) {
-    case 'subscribe':
-      await sharedLogger({
-        service: SERVICE_NAME,
-        level: 'info',
-        message: { type: 'subscribe_command', payload },
-      });
+/**
+ * 🛑 Заглушка на будущее
+ */
+export async function stopRedisConsumer() {
+  // 🔕
+}
+
+/**
+ * 🧠 Обработка одной команды из Redis Stream
+ */
+async function processRedisCommand(type, payload) {
+  // ✅ Валидация payload по схеме
+  const { valid, missingFields } = validateEvent(type, payload);
+
+  if (!valid) {
+    await sharedLogger({
+      service: SERVICE_NAME,
+      level: 'warn',
+      message: {
+        type: 'invalid_payload',
+        event: type,
+        missingFields,
+        payload,
+      },
+    });
+    return;
+  }
+
+  // 📥 Лог: команда получена
+  await sharedLogger({
+    service: SERVICE_NAME,
+    level: 'info',
+    message: { type: `${type}_received`, payload },
+  });
+
+  switch (type) {
+    /**
+     * 📌 Подписка на аккаунт
+     */
+    case 'subscribe_command':
+      if (payload.priority === true) {
+        try {
+          const { markAccountAsPrioritized } = await import('../queue/perAccountPublishQueueManager.js');
+          markAccountAsPrioritized(payload.chain_id, payload.account);
+
+          await sharedLogger({
+            service: SERVICE_NAME,
+            level: 'info',
+            message: {
+              type: 'subscribe_priority_marked',
+              chain_id: payload.chain_id,
+              account: payload.account,
+            },
+          });
+        } catch (err) {
+          await sharedLogger({
+            service: SERVICE_NAME,
+            level: 'error',
+            message: {
+              type: 'subscribe_priority_failed',
+              error: err.message,
+            },
+          });
+        }
+      }
 
       await subscribeToAccount({
         chain_id: payload.chain_id,
         account: payload.account,
-        subscription_type: payload.subscription_type,
+        last_signature: payload.last_signature,
+        history_max_age_ms: payload.history_max_age_ms,
+        priority: payload.priority === true,
       });
       break;
 
-    case 'unsubscribe':
-      await sharedLogger({
-        service: SERVICE_NAME,
-        level: 'info',
-        message: { type: 'unsubscribe_command', payload },
-      });
-
+    /**
+     * 🛑 Отписка от аккаунта
+     */
+    case 'unsubscribe_command':
       await unsubscribeFromAccount(`${payload.chain_id}:${payload.account}`);
       break;
 
-    case 'update_config':
-      await handleUpdateConfigCommand();
-      break;
+    /**
+     * 🔄 Обновление конфигурации
+     * Обновляет только нужные модули
+     */
+    case 'config_update_command': {
+      const { old, updated } = await updateAndReloadConfig();
 
-    default:
-      await sharedLogger({
-        service: SERVICE_NAME,
-        level: 'warn',
-        message: { type: 'unknown_command', payload },
-      });
+      if (old.silence_threshold_ms !== updated.silence_threshold_ms) {
+        await sharedLogger({
+          service: updated.service_name,
+          level: 'info',
+          message: {
+            type: 'silence_threshold_updated',
+            from: old.silence_threshold_ms,
+            to: updated.silence_threshold_ms,
+          },
+        });
+      }
+
+      if (old.parse_concurrency !== updated.parse_concurrency) {
+        stopParseQueueWorker();
+        startParseQueueWorker();
+
+        await sharedLogger({
+          service: updated.service_name,
+          level: 'info',
+          message: {
+            type: 'parse_queue_concurrency_updated',
+            from: old.parse_concurrency,
+            to: updated.parse_concurrency,
+          },
+        });
+      }
+
+      const controlsChanged = JSON.stringify(old.control_accounts) !== JSON.stringify(updated.control_accounts);
+
+      if (controlsChanged) {
+        await resubscribeAll();
+
+        await sharedLogger({
+          service: updated.service_name,
+          level: 'info',
+          message: {
+            type: 'control_accounts_updated',
+            old: old.control_accounts,
+            new: updated.control_accounts,
+          },
+        });
+      }
+
+      break;
+    }
   }
 }
 
-export async function handleUpdateConfigCommand() {
-  await sharedLogger({
-    service: SERVICE_NAME,
-    level: 'info',
-    message: { type: 'config_update_command' },
-  });
 
-  await updateAndReloadConfig();
-  await resubscribeAll();
-}
+/services/solana_subscriber/config/validateConfig.js:
+// services/solana_subscriber/config/validateConfig.js
 
+/**
+ * ✅ Модуль для валидации конфигурации подписчика из таблицы subscriber_config.
+ * Используется после загрузки, до применения config.
+ *
+ * 💡 Проверяет:
+ * - обязательные поля
+ * - корректность типов
+ * - допустимость значений
+ * - минимальные ограничения (например, parse_concurrency >= 1)
+ */
+
+export function validateConfig(config) {
+    const errors = [];
+  
+    // 1. Проверка, что это объект
+    if (!config || typeof config !== 'object') {
+      errors.push('config не является объектом');
+      return { valid: false, errors };
+    }
+  
+    // 2. rpc_endpoints — обязательный, массив
+    if (!Array.isArray(config.rpc_endpoints) || config.rpc_endpoints.length === 0) {
+      errors.push('rpc_endpoints должен быть непустым массивом');
+    }
+  
+    // 3. control_accounts — массив строк
+    if (!Array.isArray(config.control_accounts)) {
+      errors.push('control_accounts должен быть массивом строк');
+    }
+  
+    // 4. Числовые поля (проверка что число и больше нуля)
+    const numericFields = [
+      'silence_threshold_ms',
+      'queue_max_length',
+      'rpc_timeout_ms',
+      'parse_concurrency',
+      'max_parse_duration_ms',
+      'heartbeat_interval_ms',
+      'default_history_max_age_ms',
+      'recovery_cooldown_ms',
+      'http_limit_per_sec',
+      'ws_limit_per_sec',
+    ];
+  
+    for (const key of numericFields) {
+      const val = config[key];
+      if (typeof val !== 'number' || val < 0 || Number.isNaN(val)) {
+        errors.push(`${key} должно быть числом >= 0`);
+      }
+    }
+  
+    // 5. service_name — строка
+    if (typeof config.service_name !== 'string' || config.service_name.length === 0) {
+      errors.push('service_name должен быть строкой');
+    }
+  
+    // 6. stream_subscription_state — строка
+    if (typeof config.stream_subscription_state !== 'string' || config.stream_subscription_state.length === 0) {
+      errors.push('stream_subscription_state должен быть строкой');
+    }
+  
+    // 7. heartbeat_stream_key — строка
+    if (typeof config.heartbeat_stream_key !== 'string' || config.heartbeat_stream_key.length === 0) {
+      errors.push('heartbeat_stream_key должен быть строкой');
+    }
+  
+    // 8. commitment — допустимые значения
+    const allowedCommitments = ['processed', 'confirmed', 'finalized'];
+    if (!allowedCommitments.includes(config.commitment)) {
+      errors.push(`commitment должен быть одним из: ${allowedCommitments.join(', ')}`);
+    }
+  
+    return {
+      valid: errors.length === 0,
+      errors,
+    };
+  }
+  
 
 /services/solana_subscriber/db/db.js:
-import pg from 'pg';
-import { sharedLogger } from '../../../utils/sharedLogger.js';
+// services/solana_subscriber/db/db.js
 
+// ✅ ГОТОВ
+
+import pg from 'pg';
+import promiseRetry from 'promise-retry';
+import { sharedLogger } from '../../../utils/sharedLogger.js';
+import { getCurrentConfig } from '../config/configLoader.js';
+import { CONFIG } from '../../../utils/config/index.js'; // централизованный доступ к переменным
+
+// 🎯 Создаём общий пул соединений PostgreSQL
 export const pool = new pg.Pool({
-  connectionString: process.env.POSTGRES_URL || 'postgres://user:pass@localhost:5432/yourdb',
+  connectionString: CONFIG.db.connectionString,
 });
 
+// 🧠 Флаг инициализации (предотвращает повторное подключение)
+let isInitialized = false;
+
+/**
+ * ⚙️ Инициализация подключения к PostgreSQL.
+ * 
+ * Поведение:
+ * - Подключается через пул
+ * - Делает до 5 попыток (с задержками)
+ * - Логирует успешное подключение
+ * - Завершает процесс при фатальной ошибке
+ */
 export async function initPostgres() {
-  await pool.connect(); // тестируем подключение
+  // ⛔ Уже инициализировано — выходим
+  if (isInitialized) return;
+
   try {
-    await sharedLogger({
-      service: 'solana_subscriber',
-      level: 'info',
-      message: { type: 'postgres_connected', message: 'Подключено к PostgreSQL' },
+    // 🔁 Повторяем подключение с ретраями (до 5 раз)
+    await promiseRetry(async (retry, attempt) => {
+      try {
+        const client = await pool.connect(); // 🔌 проверка соединения
+        client.release(); // 🔓 освобождаем
+
+        // ✅ Логируем успешное подключение
+        await sharedLogger({
+          service: getCurrentConfig().service_name,
+          level: 'info',
+          message: {
+            type: 'postgres_connected',
+            message: `Подключено к PostgreSQL (попытка #${attempt})`,
+          },
+        });
+
+        isInitialized = true; // 🧠 помечаем как инициализированное
+
+      } catch (err) {
+        // 🟡 Логируем неудачную попытку (warning, но не критично)
+        try {
+          await sharedLogger({
+            service: getCurrentConfig().service_name,
+            level: 'warn',
+            message: {
+              type: 'postgres_connection_attempt_failed',
+              attempt,
+              error: err.message,
+            },
+          });
+        } catch (_) {}
+
+        retry(err); // 🔁 повторяем попытку
+      }
+    }, {
+      retries: 5,
+      minTimeout: 1000,
+      maxTimeout: 5000,
     });
-  } catch (_) {}
+
+  } catch (err) {
+    // ❌ Все попытки неудачны — логируем и завершаем
+    try {
+      await sharedLogger({
+        service: getCurrentConfig().service_name,
+        level: 'error',
+        message: {
+          type: 'postgres_connection_failed',
+          error: err.message,
+        },
+      });
+    } catch (_) {}
+
+    process.exit(1); // ⛔ Завершаем процесс
+  }
 }
 
+/**
+ * 🛑 Закрытие пула соединений PostgreSQL.
+ * 
+ * Поведение:
+ * - Закрывает пул только если он был инициализирован
+ * - Логирует отключение
+ * - Безопасен при повторных вызовах
+ */
 export async function closePostgres() {
-  await pool.end();
+  // 🔕 Если не подключались — ничего не делаем
+  if (!isInitialized) return;
+
   try {
+    await pool.end(); // 🧹 Закрываем соединения
+
     await sharedLogger({
-      service: 'solana_subscriber',
+      service: getCurrentConfig().service_name,
       level: 'info',
-      message: { type: 'postgres_disconnected', message: 'Отключено от PostgreSQL' },
+      message: {
+        type: 'postgres_disconnected',
+        message: 'Отключено от PostgreSQL',
+      },
     });
-  } catch (_) {}
+  } catch (err) {
+    // ⚠️ Логируем ошибку при закрытии (через sharedLogger)
+    try {
+      await sharedLogger({
+        service: getCurrentConfig().service_name,
+        level: 'warn',
+        message: {
+          type: 'postgres_disconnect_failed',
+          error: err.message,
+        },
+      });
+    } catch (_) {}
+  }
 }
 
 
 /services/solana_subscriber/db/subscriberConfig.js:
+// services/solana_subscriber/db/subscriberConfig.js
+
+// ✅ ГОТОВ
+
+// 📦 Импорт пула PostgreSQL из модуля db.js
 import { pool } from './db.js';
 
+// 📢 Логгер, общий для всех сервисов (отправляет в Redis stream)
+import { sharedLogger } from '../../../utils/sharedLogger.js';
+
+// 🧠 Получение имени сервиса для логов
+import { getCurrentConfig } from '../config/configLoader.js';
+
+/**
+ * 📡 Загружает актуальную конфигурацию подписчика из базы данных.
+ * 
+ * Использует таблицу `subscriber_config`, в которой хранится
+ * JSON-конфигурация микросервиса `solana_subscriber`.
+ * 
+ * Возвращает объект последней записи, отсортированной по `updated_at DESC`.
+ */
 export async function getSubscriberConfigFromDb() {
+  // 📜 SQL-запрос: выбираем последнюю (по времени) конфигурацию
   const query = `
     SELECT 
       rpc_endpoints,
       control_accounts,
       silence_threshold_ms,
       queue_max_length,
-      rpc_timeout_ms
+      rpc_timeout_ms,
+      parse_concurrency,
+      parse_queue_max_length,
+      max_parse_duration_ms,
+      heartbeat_interval_ms,
+      default_history_max_age_ms,
+      recovery_cooldown_ms,
+      http_limit_per_sec,
+      ws_limit_per_sec,
+      service_name,
+      stream_subscription_state,
+      heartbeat_stream_key
     FROM subscriber_config
     ORDER BY updated_at DESC
     LIMIT 1;
   `;
 
+  // 📥 Выполняем SQL-запрос
   const { rows } = await pool.query(query);
 
+  // ⚠️ Если нет результатов — считаем это фатальной ошибкой
   if (!rows.length) {
     throw new Error('Нет доступной конфигурации в таблице subscriber_config');
   }
 
+  // ✅ Опциональное логирование успешной загрузки
+  try {
+    await sharedLogger({
+      service: getCurrentConfig().service_name,
+      level: 'info',
+      message: {
+        type: 'subscriber_config_loaded',
+        preview: {
+          updated_keys: Object.keys(rows[0]), // 🔍 логируем только ключи (без значений)
+        },
+      },
+    });
+  } catch (_) {}
+
+  // 📦 Возвращаем объект с параметрами (одна запись)
   return rows[0];
 }
 
 
 /services/solana_subscriber/db/subscriptions.js:
+// services/solana_subscriber/db/subscriptions.js
+
+// ✅ ГОТОВ
+
+// 📦 Импорт пула соединений PostgreSQL
 import { pool } from './db.js';
 
+// 🧠 Импорт конфигурации сервиса (для sharedLogger)
+import { getCurrentConfig } from '../config/configLoader.js';
+
+// 📢 Общий логгер, отправляющий сообщения в Redis stream
+import { sharedLogger } from '../../../utils/sharedLogger.js';
+
+/**
+ * 🔁 Получает все активные подписки из таблицы `subscriptions`.
+ * Используется при старте сервиса, чтобы восстановить подписки.
+ */
 export async function getActiveSubscriptions() {
   const { rows } = await pool.query(`
-    SELECT chain_id, account, subscription_type
+    SELECT chain_id, account, priority
     FROM subscriptions
     WHERE active = true
   `);
-  return rows;
+
+  return rows; // [{ chain_id, account, priority }]
 }
 
+/**
+ * 💾 Обновляет поле `last_signature` и метку времени `updated_at`
+ * для указанной подписки (chain_id + account).
+ */
 export async function updateLastSignature(chain_id, account, signature) {
   await pool.query(
     `
@@ -232,6 +646,10 @@ export async function updateLastSignature(chain_id, account, signature) {
   );
 }
 
+/**
+ * 🧾 Получает текущую сохранённую сигнатуру (`last_signature`)
+ * для пары `chain_id:account`. Используется при восстановлении истории.
+ */
 export async function getLastSignatureForAccount(chain_id, account) {
   const { rows } = await pool.query(
     `
@@ -240,7 +658,164 @@ export async function getLastSignatureForAccount(chain_id, account) {
     `,
     [chain_id, account]
   );
+
   return rows[0]?.last_signature || null;
+}
+
+/**
+ * 🔁 Вставляет новую подписку или обновляет существующую.
+ * 
+ * Поведение:
+ * - если подписка отсутствует → вставка (`INSERT`)
+ * - если уже есть → обновление только переданных полей (`UPDATE`)
+ * 
+ * Всегда устанавливает `active = true`.
+ */
+export async function upsertSubscription({
+  chain_id,
+  account,
+  last_signature,
+  history_max_age_ms,
+  priority
+}) {
+  try {
+    // 🔍 Проверка на наличие подписки
+    const existing = await pool.query(
+      `SELECT * FROM subscriptions WHERE chain_id = $1 AND account = $2`,
+      [chain_id, account]
+    );
+
+    // 🟢 Вставка новой записи
+    if (existing.rows.length === 0) {
+      await pool.query(
+        `
+        INSERT INTO subscriptions (
+          chain_id, account, active, last_signature, history_max_age_ms, priority
+        ) VALUES ($1, $2, true, $3, $4, $5)
+        `,
+        [
+          chain_id,
+          account,
+          last_signature,
+          history_max_age_ms,
+          priority === true
+        ]
+      );
+
+      await sharedLogger({
+        service: getCurrentConfig().service_name,
+        level: 'info',
+        message: {
+          type: 'subscription_inserted',
+          chain_id,
+          account,
+          last_signature,
+          history_max_age_ms,
+          priority: priority === true,
+        },
+      });
+
+    } else {
+      // 🟡 Обновление существующей записи
+      const updates = [];
+      const values = [chain_id, account];
+      let paramIndex = 3;
+
+      if (last_signature !== undefined) {
+        updates.push(`last_signature = $${paramIndex++}`);
+        values.push(last_signature);
+      }
+
+      if (history_max_age_ms !== undefined) {
+        updates.push(`history_max_age_ms = $${paramIndex++}`);
+        values.push(history_max_age_ms);
+      }
+
+      if (priority !== undefined) {
+        updates.push(`priority = $${paramIndex++}`);
+        values.push(priority === true);
+      }
+
+      updates.push(`active = true`);
+      updates.push(`updated_at = CURRENT_TIMESTAMP`);
+
+      await pool.query(
+        `
+        UPDATE subscriptions
+        SET ${updates.join(', ')}
+        WHERE chain_id = $1 AND account = $2
+        `,
+        values
+      );
+
+      await sharedLogger({
+        service: getCurrentConfig().service_name,
+        level: 'info',
+        message: {
+          type: 'subscription_updated',
+          chain_id,
+          account,
+          updated_fields: updates,
+        },
+      });
+    }
+
+  } catch (err) {
+    await sharedLogger({
+      service: getCurrentConfig().service_name,
+      level: 'error',
+      message: {
+        type: 'upsert_subscription_failed',
+        chain_id,
+        account,
+        error: err.message,
+      },
+    });
+
+    throw err;
+  }
+}
+
+/**
+ * 🔻 Помечает подписку как неактивную (active = false).
+ * Используется при отписке от аккаунта.
+ */
+export async function deactivateSubscription({ chain_id, account }) {
+  try {
+    await pool.query(
+      `
+      UPDATE subscriptions
+      SET active = false,
+          updated_at = NOW()
+      WHERE chain_id = $1 AND account = $2
+      `,
+      [chain_id, account]
+    );
+
+    await sharedLogger({
+      service: getCurrentConfig().service_name,
+      level: 'info',
+      message: {
+        type: 'subscription_deactivated',
+        chain_id,
+        account,
+      },
+    });
+
+  } catch (err) {
+    await sharedLogger({
+      service: getCurrentConfig().service_name,
+      level: 'error',
+      message: {
+        type: 'deactivate_subscription_failed',
+        chain_id,
+        account,
+        error: err.message,
+      },
+    });
+
+    throw err;
+  }
 }
 
 
@@ -253,285 +828,597 @@ process.on('SIGTERM', shutdown);
 start();
 
 
-/services/solana_subscriber/queue/onLogsQueue.js:
-import { sharedLogger } from '@/utils/sharedLogger.js';
+/services/solana_subscriber/queue/parseQueue.js:
+// services/solana_subscriber/queue/parseQueue.js
 
-const SERVICE_NAME = 'solana_subscriber';
-const MAX_QUEUE_LENGTH = 1000;
+// ✅ ГОТОВ
 
-const queue = [];
-const queuedSet = new Set(); // 🆕 Храним уникальные сигнатуры для deduplication
+/**
+ * 🧠 Очередь парсинга транзакций по сигнатурам (txid), полученных через WebSocket или восстановление.
+ *
+ * 💡 Новая логика:
+ * - вместо sleep(200) при пустой очереди — воркеры "засыпают"
+ * - при поступлении новой задачи — "будим" воркеры через Promise
+ */
 
-export function enqueueSignature(signature) {
-  if (queuedSet.has(signature)) return;
-
-  if (queue.length >= MAX_QUEUE_LENGTH) {
-    try {
-      sharedLogger({
-        service: SERVICE_NAME,
-        level: 'warn',
-        message: {
-          event: 'queue_overflow',
-          type: 'rate_limit',
-          signature,
-        },
-      });
-    } catch (_) {}
-    return;
-  }
-
-  queue.push(signature);
-  queuedSet.add(signature);
-}
-
-export function dequeueSignature() {
-  const sig = queue.shift();
-  if (sig) queuedSet.delete(sig);
-  return sig;
-}
-
-export function getQueueLength() {
-  return queue.length;
-}
-
-export async function processQueue(handler) {
-  if (queue.length === 0) return;
-
-  try {
-    await sharedLogger({
-      service: SERVICE_NAME,
-      level: 'info',
-      message: {
-        event: 'queue_resumed',
-        queue_length: queue.length,
-      },
-    });
-  } catch (_) {}
-
-  while (queue.length > 0) {
-    const signature = dequeueSignature();
-    await handler(signature);
-  }
-}
-
-
-/services/solana_subscriber/queue/onLogsQueueWorker.js:
-import { getAvailableRpc } from '../rpc/rpcPool.js';
 import { getParsedTransactionWithTimeout } from '../rpc/rpcUtils.js';
-import { enqueueSignature, dequeueSignature, getQueueLength } from './onLogsQueue.js';
-import { scheduleRetry } from './retryQueue.js';
-import { sharedLogger } from '../../../utils/sharedLogger.js';
-import { redisPublishLog } from '../utils/redisLogSender.js';
-import { updateLastSignature } from '../db/subscriptions.js';
 import { getCurrentConfig } from '../config/configLoader.js';
+import { enqueueTransaction } from './publishQueue.js';
+import { sharedLogger } from '../../../utils/sharedLogger.js';
+import { sleep } from '../../../utils/sleep.js';
 
-const SERVICE_NAME = 'solana_subscriber';
-let running = false;
+// 📦 Очередь задач на парсинг
+const queue = [];
 
-export function startOnLogsQueueWorker() {
-  running = true;
-  pollQueueLoop();
-}
+// 🏃‍♂️ Статус запущенности воркеров
+let isRunning = false;
 
-export function stopOnLogsQueueWorker() {
-  running = false;
-}
+// 🔢 Сколько задач сейчас выполняется
+let runningTasks = 0;
 
-async function pollQueueLoop() {
-  while (running) {
-    await __runSinglePollIteration();
-    await new Promise(r => setTimeout(r, 2000));
+// 🔔 Механизм ожидания новых задач (если очередь пуста)
+let resolver = null;
+let waitForNewTask = new Promise((res) => {
+  resolver = res;
+});
+
+/**
+ * 📥 Добавляет новую задачу в очередь парсинга и будит воркеров, если они "спят".
+ *
+ * @param {Object} task - объект { chain_id, account, signature, enqueuedAt? }
+ */
+export function enqueueSignature(task) {
+  if (!task.enqueuedAt) {
+    task.enqueuedAt = Date.now();
+  }
+
+  queue.push(task);
+
+  // ⏰ Будим воркеров, если они ожидали новую задачу
+  if (resolver) {
+    resolver(); // пробуждаем
+    resolver = null;
+    waitForNewTask = new Promise((res) => {
+      resolver = res; // создаём новое ожидание
+    });
   }
 }
 
-export async function __runSinglePollIteration() {
-  const length = getQueueLength();
+/**
+ * 🚀 Запускает N воркеров для обработки очереди.
+ * Количество воркеров задаётся параметром parse_concurrency из config.
+ */
+export function startParseQueueWorker() {
+  if (isRunning) return;
+  isRunning = true;
 
-  if (length > 0) {
-    try {
-      await sharedLogger({
-        service: SERVICE_NAME,
-        level: 'info',
-        message: {
-          event: 'queue_resumed',
-          queue_length: length,
-        },
-      });
-    } catch (_) {}
-  }
+  const concurrency = getCurrentConfig().parse_concurrency || 3;
 
-  while (getQueueLength() > 0 && running) {
-    await __processOneQueueItem();
+  for (let i = 0; i < concurrency; i++) {
+    runWorkerLoop(); // 🔁 запускаем каждый воркер
   }
 }
 
-export async function __processOneQueueItem({
-  chain_id = 'unknown',
-  account = 'unknown',
-  subscription_type = 'regular',
-} = {}) {
-  const signature = dequeueSignature();
-  const rpc = await getAvailableRpc();
-  if (!rpc) {
-    enqueueSignature(signature);
-    return;
-  }
+/**
+ * 🛑 Останавливает все воркеры (используется при обновлении конфига).
+ */
+export function stopParseQueueWorker() {
+  isRunning = false;
+}
 
-  const parsed = await getParsedTransactionWithTimeout(rpc, signature);
-  if (!parsed) {
-    await scheduleRetry(signature);
-    return;
-  }
+/**
+ * 🔁 Воркер:
+ * - забирает задачу
+ * - если нет задач — ждёт, пока придёт новая
+ * - обрабатывает транзакцию
+ */
+async function runWorkerLoop() {
+  while (isRunning) {
+    const task = queue.shift();
 
-  if (parsed.meta?.err) {
-    try {
-      await sharedLogger({
-        service: SERVICE_NAME,
-        level: 'warn',
-        message: {
-          type: 'failed_transaction',
-          signature,
-          error: parsed.meta.err,
-        },
-      });
-    } catch (_) {}
-    return;
-  }
+    if (!task) {
+      await waitForNewTask; // 💤 ждём, пока поступит новая задача
+      continue;
+    }
 
-  const blockTime = parsed.blockTime || null;
-  const timestamp = blockTime ? blockTime * 1000 : Date.now();
-
-  const message = {
-    chain_id,
-    account,
-    signature,
-    log: parsed,
-    subscription_type,
-    blockTime,
-    timestamp,
-  };
-
-  const streamKey =
-    subscription_type === 'share'
-      ? 'solana_logs_share'
-      : subscription_type === 'mint'
-      ? 'solana_logs_mint'
-      : subscription_type === 'spl_token'
-      ? 'solana_logs_spl'
-      : subscription_type === 'control'
-      ? 'solana_logs_control'
-      : 'solana_logs_regular';
-
-  try {
-    await redisPublishLog(streamKey, message);
+    runningTasks++;
 
     try {
-      await updateLastSignature(chain_id, account, signature);
+      await handleSignatureTask(task);
     } catch (err) {
       try {
         await sharedLogger({
-          service: SERVICE_NAME,
+          service: getCurrentConfig().service_name,
           level: 'error',
           message: {
-            type: 'update_signature_failed',
-            signature,
+            type: 'parse_queue_crash',
             error: err.message,
           },
         });
       } catch (_) {}
     }
 
-    try {
-      await sharedLogger({
-        service: SERVICE_NAME,
-        level: 'info',
-        message: {
-          type: 'transaction_dispatched_from_queue',
-          signature,
-          rpc_id: rpc.id,
-        },
-      });
-    } catch (_) {}
-  } catch (err) {
-    try {
-      await sharedLogger({
-        service: SERVICE_NAME,
-        level: 'error',
-        message: {
-          type: 'redis_publish_failed',
-          signature,
-          error: err.message,
-        },
-      });
-    } catch (_) {}
-    await scheduleRetry(signature);
+    runningTasks--;
   }
 }
 
-export { pollQueueLoop };
-export function __setRunning(value) {
-  running = value;
+/**
+ * ⚙️ Обрабатывает одну сигнатуру:
+ * - проверяет "свежесть"
+ * - делает getParsedTransaction с таймаутом
+ * - в случае успеха — передаёт в publishQueue
+ * - в случае ошибки — возвращает обратно в очередь
+ */
+async function handleSignatureTask(task) {
+  const config = getCurrentConfig();
+  const maxAge = config.max_parse_duration_ms || 86400000;
+  const now = Date.now();
+
+  // ⏳ Пропускаем задачу, если она слишком старая
+  if (now - task.enqueuedAt > maxAge) {
+    try {
+      await sharedLogger({
+        service: config.service_name,
+        level: 'warn',
+        message: {
+          type: 'unresolved_transaction',
+          signature: task.signature,
+          reason: 'max_age_exceeded',
+        },
+      });
+    } catch (_) {}
+    return;
+  }
+
+  try {
+    const rpc = await import('../rpc/rpcPool.js').then(mod => mod.getAvailableRpc());
+    if (!rpc) {
+      enqueueSignature(task); // retry позже
+      return;
+    }
+
+    if (!rpc.httpLimiter.removeToken()) {
+      enqueueSignature(task); // лимит превышен — retry
+      await sleep(100);
+      return;
+    }
+
+    const parsed = await getParsedTransactionWithTimeout(rpc, task.signature);
+    if (!parsed) {
+      enqueueSignature(task); // пустой результат — retry
+      return;
+    }
+
+    const blockTime = parsed.blockTime || null;
+    const timestamp = blockTime ? blockTime * 1000 : Date.now();
+
+    const message = {
+      chain_id: task.chain_id,
+      account: task.account,
+      signature: task.signature,
+      log: parsed,
+      blockTime,
+      timestamp,
+    };
+
+    enqueueTransaction(message); // ✅ передаём на публикацию
+
+  } catch (err) {
+    enqueueSignature(task); // ошибка → retry
+  }
 }
-export { __runSinglePollIteration }; // 👈
 
-/services/solana_subscriber/queue/redisRetryQueue.js:
-import { redisPublishLog } from '../utils/redisLogSender.js';
-import { updateLastSignature } from '../db/subscriptions.js';
+
+/services/solana_subscriber/queue/perAccountPublishQueueManager.js:
+// services/solana_subscriber/queue/perAccountPublishQueueManager.js
+
+// ✅ ГОТОВ
+
+/**
+ * 🧩 Модуль для обработки приоритетных аккаунтов.
+ * Для каждого приоритетного аккаунта создаётся отдельная очередь и воркер.
+ * Это позволяет:
+ * - обходить лимиты
+ * - изолировать обработку от общей очереди
+ * - давать "VIP" аккаунтам ускоренную обработку
+ */
+
+import { getParsedTransactionWithTimeout } from '../rpc/rpcUtils.js';
+import { enqueueTransaction } from './publishQueue.js';
+import { getCurrentConfig } from '../config/configLoader.js';
 import { sharedLogger } from '../../../utils/sharedLogger.js';
+import { sleep } from '../../../utils/sleep.js';
 
-const SERVICE_NAME = 'solana_subscriber';
-const retryQueue = [];
+// 📌 Аккаунты с приоритетной обработкой
+const prioritizedAccounts = new Set(); // key = `${chain_id}:${account}`
 
-let running = false;
+// 📦 Очереди задач по каждому приоритетному аккаунту
+const accountQueues = new Map();       // key → [{...}]
 
-export function startRedisRetryWorker() {
-  running = true;
+// 🌀 Состояния воркеров (запущен или нет)
+const isRunningMap = new Map();        // key → boolean
+
+// 🔔 Промисы ожидания новой задачи по аккаунту
+const queueResolvers = new Map();      // key → resolver (будильник)
+const queueWaiters = new Map();        // key → Promise (ожидание новой задачи)
+
+/**
+ * ✅ Отметить аккаунт как приоритетный.
+ * Создаёт очередь и воркер, если они ещё не существуют.
+ */
+export function markAccountAsPrioritized(chain_id, account) {
+  const key = `${chain_id}:${account}`;
+  prioritizedAccounts.add(key);
+
+  if (!accountQueues.has(key)) {
+    accountQueues.set(key, []);
+    isRunningMap.set(key, false);
+
+    // инициализируем механизм ожидания
+    queueWaiters.set(key, new Promise(res => queueResolvers.set(key, res)));
+
+    startPerAccountWorker(chain_id, account);
+  }
+}
+
+/**
+ * 🔍 Проверяет, является ли аккаунт приоритетным
+ */
+export function isPrioritized(chain_id, account) {
+  return prioritizedAccounts.has(`${chain_id}:${account}`);
+}
+
+/**
+ * 📥 Добавить задачу в очередь приоритетного аккаунта
+ */
+export function enqueueToPerAccountPublishQueue(task) {
+  const key = `${task.chain_id}:${task.account}`;
+  const queue = accountQueues.get(key);
+  if (!queue) return;
+
+  if (!task.enqueuedAt) {
+    task.enqueuedAt = Date.now();
+  }
+
+  queue.push(task);
+
+  // 🛎️ Будим воркер, если он ждёт
+  const resolver = queueResolvers.get(key);
+  if (resolver) {
+    resolver();
+    queueResolvers.set(key, null);
+    queueWaiters.set(key, new Promise(res => queueResolvers.set(key, res)));
+  }
+}
+
+/**
+ * 🚀 Запуск воркера для одного аккаунта
+ */
+function startPerAccountWorker(chain_id, account) {
+  const key = `${chain_id}:${account}`;
+  if (isRunningMap.get(key)) return;
+  isRunningMap.set(key, true);
+
+  const queue = accountQueues.get(key);
+  const maxAge = getCurrentConfig().max_parse_duration_ms || 86400000;
+
+  (async function loop() {
+    while (true) {
+      const task = queue.shift();
+
+      // 💤 Если очередь пуста — ждём новую задачу
+      if (!task) {
+        await queueWaiters.get(key);
+        continue;
+      }
+
+      const now = Date.now();
+      if (now - task.enqueuedAt > maxAge) {
+        try {
+          await sharedLogger({
+            service: getCurrentConfig().service_name,
+            level: 'warn',
+            message: {
+              type: 'unresolved_transaction_priority',
+              signature: task.signature,
+              chain_id: task.chain_id,
+              account: task.account,
+              reason: 'max_age_exceeded',
+            },
+          });
+        } catch (_) {}
+        continue;
+      }
+
+      try {
+        const rpc = await import('../rpc/rpcPool.js').then(mod => mod.getAvailableRpc());
+        if (!rpc) {
+          queue.push(task);
+          continue;
+        }
+
+        if (!rpc.httpLimiter.removeToken()) {
+          queue.push(task);
+          await sleep(100);
+          continue;
+        }
+
+        const parsed = await getParsedTransactionWithTimeout(rpc, task.signature);
+        if (!parsed) {
+          queue.push(task);
+          continue;
+        }
+
+        const blockTime = parsed.blockTime || null;
+        const timestamp = blockTime ? blockTime * 1000 : Date.now();
+
+        const message = {
+          chain_id: task.chain_id,
+          account: task.account,
+          signature: task.signature,
+          log: parsed,
+          blockTime,
+          timestamp,
+        };
+
+        enqueueTransaction(message);
+      } catch (err) {
+        queue.push(task);
+        try {
+          await sharedLogger({
+            service: getCurrentConfig().service_name,
+            level: 'error',
+            message: {
+              type: 'priority_worker_failed',
+              signature: task.signature,
+              chain_id: task.chain_id,
+              account: task.account,
+              error: err.message,
+            },
+          });
+        } catch (_) {}
+      }
+    }
+  })();
+}
+
+
+/services/solana_subscriber/queue/publishQueue.js:
+// services/solana_subscriber/queue/publishQueue.js
+
+// ✅ ГОТОВ
+
+/**
+ * 📤 Очередь публикации готовых транзакций в Redis Stream.
+ * Обеспечивает:
+ * - публикацию события `transaction_published`
+ * - сохранение last_signature в БД
+ * - обработку ошибок и повторные попытки
+ */
+
+import { publishToStream } from '../../../utils/redisStreamBus.js';
+import { updateLastSignature } from '../db/subscriptions.js';
+import { setPendingUpdate } from './signatureUpdateBuffer.js';
+import { sharedLogger } from '../../../utils/sharedLogger.js';
+import { getCurrentConfig } from '../config/configLoader.js';
+
+// 📦 Очередь готовых к публикации задач
+const queue = [];
+
+// 🔃 Состояние воркера
+let isRunning = false;
+
+// 🔔 Механизм ожидания новых задач
+let resolver = null;
+let waitForNewTask = new Promise((res) => {
+  resolver = res;
+});
+
+/**
+ * 📥 Ставит готовую транзакцию в очередь публикации
+ */
+export function enqueueTransaction(message) {
+  queue.push(message);
+
+  // 🛎️ Если воркер "спит", будим его
+  if (resolver) {
+    resolver();
+    resolver = null;
+    waitForNewTask = new Promise((res) => {
+      resolver = res;
+    });
+  }
+}
+
+/**
+ * 🚀 Запускает фоновый воркер для обработки очереди
+ */
+export function startPublishQueueWorker() {
+  if (isRunning) return;
+  isRunning = true;
   workerLoop();
 }
 
-export function stopRedisRetryWorker() {
-  running = false;
-}
-
-export function enqueueRedisRetry({ streamKey, message }) {
-  retryQueue.push({ streamKey, message, retries: 0 });
-}
-
+/**
+ * 🔁 Воркер:
+ * - ждёт появления задач
+ * - публикует транзакции
+ * - сохраняет last_signature
+ * - обрабатывает ошибки
+ */
 async function workerLoop() {
-  while (running) {
-    if (retryQueue.length === 0) {
-      await sleep(2000);
+  while (isRunning) {
+    const task = queue.shift();
+
+    if (!task) {
+      await waitForNewTask; // 💤 ждём поступления новой задачи
       continue;
     }
 
-    const item = retryQueue.shift();
-    const { streamKey, message, retries } = item;
-
     try {
-      await redisPublishLog(streamKey, message);
-      await updateLastSignature(message.chain_id, message.account, message.signature);
+      // 1️⃣ Публикация события
+      await publishToStream({
+        service: getCurrentConfig().service_name,
+        type: 'transaction_published',
+        payload: task,
+      });
 
+      // 2️⃣ Сохраняем сигнатуру
       try {
+        await updateLastSignature(task.chain_id, task.account, task.signature);
+      } catch (err) {
+        setPendingUpdate(task.chain_id, task.account, task.signature);
         await sharedLogger({
-          service: SERVICE_NAME,
-          level: 'info',
+          service: getCurrentConfig().service_name,
+          level: 'warn',
           message: {
-            type: 'redis_retry_success',
-            signature: message.signature,
+            type: 'update_signature_failed',
+            signature: task.signature,
+            error: err.message,
           },
         });
-      } catch (_) {}
+      }
+
+      // 3️⃣ Логируем успешную публикацию
+      await sharedLogger({
+        service: getCurrentConfig().service_name,
+        level: 'info',
+        message: {
+          type: 'transaction_published',
+          signature: task.signature,
+          chain_id: task.chain_id,
+        },
+      });
+
     } catch (err) {
-      if (retries < 5) {
-        retryQueue.push({ ...item, retries: retries + 1 });
-      } else {
+      // 4️⃣ Ошибка публикации → retry
+      queue.push(task);
+      await sharedLogger({
+        service: getCurrentConfig().service_name,
+        level: 'error',
+        message: {
+          type: 'stream_publish_failed',
+          signature: task.signature,
+          error: err.message,
+        },
+      });
+    }
+  }
+}
+
+
+/services/solana_subscriber/queue/signatureUpdateBuffer.js:
+// services/solana_subscriber/queue/signatureUpdateBuffer.js
+
+// ✅ ГОТОВ
+
+/**
+ * Модуль буферизации задач по обновлению `last_signature` в базе данных.
+ *
+ * Используется, когда во время публикации транзакции не удалось выполнить `updateLastSignature(...)` —
+ * например, из-за временного сбоя PostgreSQL.
+ *
+ * Задачи не теряются — они помещаются в буфер, и затем повторно обрабатываются из фонового воркера.
+ */
+
+import { updateLastSignature } from '../db/subscriptions.js';
+import { sharedLogger } from '../../../utils/sharedLogger.js';
+import { getCurrentConfig } from '../config/configLoader.js';
+
+// 📦 Буфер задач: key = `${chain_id}:${account}` → signature
+const bufferMap = new Map();
+
+// 🚩 Флаг активности воркера
+let isRunning = false;
+
+// 🔔 Сигнальный механизм "ожидания новой задачи"
+let notifyResolve = null;
+
+/**
+ * Добавляет задачу на обновление подписи в буфер.
+ * Если воркер ещё не запущен — запускает его.
+ * Если воркер ждёт новую задачу — сигнализирует о поступлении.
+ */
+export function setPendingUpdate(chain_id, account, signature) {
+  const key = `${chain_id}:${account}`;
+  bufferMap.set(key, signature);
+
+  // Если воркер находится в режиме ожидания — будим его
+  if (notifyResolve) {
+    notifyResolve();
+    notifyResolve = null;
+  }
+
+  // Запускаем воркер, если он ещё не был активен
+  if (!isRunning) {
+    startSignatureUpdateWorker();
+  }
+}
+
+/**
+ * Запускает фонового воркера, если он ещё не запущен.
+ * Воркеры работают бесконечно, пока alive.
+ */
+export function startSignatureUpdateWorker() {
+  if (isRunning) return;
+  isRunning = true;
+  loop();
+}
+
+/**
+ * Основной цикл фонового воркера.
+ *
+ * Логика:
+ * - если буфер пуст — воркер "спит", пока не появится новая задача (await Promise)
+ * - если в буфере есть задачи — перебираем их и пробуем обновить `last_signature`
+ * - при успехе — удаляем из буфера
+ * - при ошибке — оставляем на повторную попытку
+ */
+async function loop() {
+  while (isRunning) {
+    const entries = Array.from(bufferMap.entries());
+
+    // 💤 Если буфер пуст — ждём прихода новых задач
+    if (entries.length === 0) {
+      await new Promise(resolve => (notifyResolve = resolve));
+      continue;
+    }
+
+    // 🔄 Обрабатываем каждую задачу в буфере
+    for (const [key, signature] of entries) {
+      const [chain_id, account] = key.split(':');
+
+      try {
+        // ⬆️ Пытаемся обновить last_signature в базе
+        await updateLastSignature(chain_id, account, signature);
+
+        // ✅ Успешно — удаляем задачу из буфера
+        bufferMap.delete(key);
+
         try {
           await sharedLogger({
-            service: SERVICE_NAME,
-            level: 'error',
+            service: getCurrentConfig().service_name,
+            level: 'info',
             message: {
-              type: 'redis_retry_failed',
-              signature: message.signature,
+              type: 'signature_updated',
+              chain_id,
+              account,
+              signature,
+            },
+          });
+        } catch (_) {}
+
+      } catch (err) {
+        // ⚠️ Ошибка — оставляем задачу в буфере и логируем предупреждение
+        try {
+          await sharedLogger({
+            service: getCurrentConfig().service_name,
+            level: 'warn',
+            message: {
+              type: 'signature_sync_failed',
+              chain_id,
+              account,
+              signature,
               error: err.message,
             },
           });
@@ -539,342 +1426,138 @@ async function workerLoop() {
       }
     }
 
-    await sleep(1000);
-  }
-}
-
-function sleep(ms) {
-  return new Promise((r) => setTimeout(r, ms));
-}
-
-
-/services/solana_subscriber/queue/retryQueue.js:
-import { sharedLogger } from '../../../utils/sharedLogger.js';
-import { getAvailableRpc } from '../rpc/rpcPool.js';
-import { redisPublishLog } from '../utils/redisLogSender.js';
-import { updateLastSignature } from '../db/subscriptions.js';
-import { withAbortTimeout } from '../../../utils/withAbortTimeout.js';
-import { getCurrentConfig } from '../config/configLoader.js';
-
-const SERVICE_NAME = 'solana_subscriber';
-const retriesMap = new Map();
-
-export async function scheduleRetry(signature) {
-  const retries = retriesMap.get(signature) || 0;
-
-  if (retries >= 3) {
-    try {
-      await sharedLogger({
-        service: SERVICE_NAME,
-        level: 'error',
-        message: {
-          type: 'unresolved_transaction',
-          signature,
-        },
-      });
-    } catch (_) {}
-    retriesMap.delete(signature);
-    return;
-  }
-
-  retriesMap.set(signature, retries + 1);
-  const delay = 1000 * Math.pow(2, retries);
-
-  try {
-    await sharedLogger({
-      service: SERVICE_NAME,
-      level: 'debug',
-      message: {
-        type: 'retry_scheduled',
-        signature,
-        attempt: retries + 1,
-        delay,
-      },
-    });
-  } catch (_) {}
-
-  setTimeout(() => {
-    tryAgain(signature).catch(async (err) => {
-      try {
-        await sharedLogger({
-          service: SERVICE_NAME,
-          level: 'error',
-          message: {
-            type: 'retry_unhandled_error',
-            signature,
-            error: err.message,
-          },
-        });
-      } catch (_) {}
-    });
-  }, delay);
-}
-
-async function tryAgain(signature) {
-  try {
-    await sharedLogger({
-      service: SERVICE_NAME,
-      level: 'debug',
-      message: {
-        type: 'try_again',
-        signature,
-      },
-    });
-  } catch (_) {}
-
-  const rpc = await getAvailableRpc();
-  console.log('⚙️ RPC:', rpc);
-
-  if (!rpc) {
-    console.log('❌ Нет RPC');
-    try {
-      await sharedLogger({
-        service: SERVICE_NAME,
-        level: 'debug',
-        message: {
-          type: 'no_available_rpc',
-          signature,
-        },
-      });
-    } catch (_) {}
-    await scheduleRetry(signature);
-    return;
-  }
-
-  const timeoutMs = getCurrentConfig().rpc_timeout_ms || 5000;
-
-  let parsed = null;
-  try {
-    parsed = await withAbortTimeout(async (_signal) => {
-      return await rpc.httpConn.getParsedTransaction(signature, {
-        commitment: 'confirmed',
-        maxSupportedTransactionVersion: 0,
-      });
-    }, timeoutMs);
-  } catch (e) {
-    console.log('❌ Ошибка при getParsedTransaction:', e);
-  }
-
-  console.log('📦 Parsed result:', parsed);
-
-  if (!parsed || parsed.meta?.err) {
-    console.log('⚠️ Parsed пустой или с ошибкой:', parsed?.meta?.err);
-    try {
-      await sharedLogger({
-        service: SERVICE_NAME,
-        level: 'debug',
-        message: {
-          type: 'parse_fail',
-          signature,
-        },
-      });
-    } catch (_) {}
-    await scheduleRetry(signature);
-    return;
-  }
-
-  const blockTime = parsed.blockTime || null;
-  const timestamp = blockTime ? blockTime * 1000 : Date.now();
-
-  const message = {
-    chain_id: 'unknown',
-    account: 'unknown',
-    signature,
-    log: parsed,
-    subscription_type: 'regular',
-    blockTime,
-    timestamp,
-  };
-
-  console.log('✅ Всё ок — вызываем redisPublishLog');
-
-  try {
-    await redisPublishLog('solana_logs_regular', message);
-    await updateLastSignature('unknown', 'unknown', signature);
-
-    try {
-      await sharedLogger({
-        service: SERVICE_NAME,
-        level: 'info',
-        message: {
-          type: 'retried_transaction_success',
-          signature,
-        },
-      });
-    } catch (_) {}
-
-    retriesMap.delete(signature);
-  } catch (err) {
-    try {
-      await sharedLogger({
-        service: SERVICE_NAME,
-        level: 'error',
-        message: {
-          type: 'logging_error',
-          signature,
-          error: err.message,
-        },
-      });
-    } catch (_) {}
-    await scheduleRetry(signature);
-  }
-}
-
-export const __retriesMap = retriesMap;
-export const __testOnlyTryAgain = tryAgain;
-
-
-
-
-/services/solana_subscriber/rpc/connectionFactory.js:
-import { Connection } from '@solana/web3.js';
-
-export function connectionFactory(httpUrl, wsUrl = null) {
-  return new Connection(httpUrl, {
-    commitment: 'confirmed',
-    ...(wsUrl ? { wsEndpoint: wsUrl } : {}),
-  });
-}
-
-
-/services/solana_subscriber/rpc/handleDisconnect.js:
-import { closeRpcPool } from './rpcPoolCore.js';
-import { sharedLogger } from '../../../utils/sharedLogger.js';
-import { resubscribeAll } from '../subscription/subscriptionManager.js';
-import { getCurrentConfig } from '../config/configLoader.js';
-
-export async function handleDisconnect(rpcId) {
-  try {
-    await sharedLogger({
-      service: 'solana_subscriber',
-      level: 'warn',
-      message: {
-        type: 'ws_disconnect',
-        rpc_id: rpcId,
-      },
-    });
-  } catch (_) {}
-
-  try {
-    await closeRpcPool();
-
-    const { rpc_endpoints } = getCurrentConfig();
-
-    const { initRpcPool } = await import('./rpcPool.js');
-    await initRpcPool(rpc_endpoints);
-
-    await resubscribeAll();
-
-    await sharedLogger({
-      service: 'solana_subscriber',
-      level: 'info',
-      message: {
-        type: 'reconnect',
-        rpc_id: rpcId,
-      },
-    });
-  } catch (err) {
-    await sharedLogger({
-      service: 'solana_subscriber',
-      level: 'error',
-      message: {
-        type: 'reconnect_failed',
-        rpc_id: rpcId,
-        error: err.message,
-      },
-    });
+    // 🔁 Переходим к следующему циклу: если буфер будет пуст — снова ждём задачу
   }
 }
 
 
 /services/solana_subscriber/rpc/rpcLimiter.js:
-// простой токен-бакет лимитер
+// services/solana_subscriber/rpc/rpcLimiter.js
+
+// ✅ ГОТОВ
+
+/**
+ * 🧠 Этот модуль реализует простой алгоритм token bucket (токен-бакет),
+ * используемый для ограничения количества RPC-запросов в секунду.
+ *
+ * 🔄 Логика:
+ *   - В начале интервала (1 секунда) в "баке" maxRequestsPerSec токенов.
+ *   - Каждый вызов removeToken() забирает 1 токен.
+ *   - Если токены закончились — запрос отклоняется (false).
+ *   - Каждую секунду бак автоматически пополняется до максимума.
+ *
+ * 📦 Используется для:
+ *   - HTTP-запросов (getParsedTransaction)
+ *   - WebSocket-событий (onLogs)
+ * 
+ * 📌 Независимо создаётся для каждого RPC клиента:
+ *   - httpLimiter — в parseQueue / recovery
+ *   - wsLimiter   — в onLogsHandler
+ */
+
+/**
+ * 🛠 Создаёт лимитер с заданным количеством разрешённых запросов в секунду.
+ * 
+ * @param {number} maxRequestsPerSec - Максимум запросов в секунду
+ * @returns {{
+*   removeToken: () => boolean,
+*   stop: () => void
+* }}
+*/
 export function createLimiter(maxRequestsPerSec) {
-    let tokens = maxRequestsPerSec;
-    const interval = setInterval(() => {
-      tokens = maxRequestsPerSec;
-    }, 1000);
-  
-    return {
-      removeToken() {
-        if (tokens > 0) {
-          tokens--;
-          return true;
-        }
-        return false;
-      },
-      stop() {
-        clearInterval(interval);
-      },
-    };
-  }
-  
+ // 🪙 Сколько токенов (запросов) осталось в текущем окне
+ let tokens = maxRequestsPerSec;
+
+ // ⏱ Каждую секунду обнуляем счётчик и выдаём новые токены
+ const interval = setInterval(() => {
+   tokens = maxRequestsPerSec;
+ }, 1000);
+
+ return {
+   /**
+    * 🔄 Пытается забрать токен (разрешение на запрос).
+    * @returns {boolean} - true если разрешено, false если лимит исчерпан
+    */
+   removeToken() {
+     if (tokens > 0) {
+       tokens--;
+       return true;
+     }
+     return false;
+   },
+
+   /**
+    * 🛑 Останавливает интервал (например, при завершении работы RPC).
+    */
+   stop() {
+     clearInterval(interval);
+   },
+ };
+}
+
 
 /services/solana_subscriber/rpc/rpcPool.js:
-import { connectionFactory } from './connectionFactory.js';
+// services/solana_subscriber/rpc/rpcPool.js
+
+// ✅ ГОТОВ
+
+/**
+ * Модуль управления пулом RPC-клиентов для Solana.
+ *
+ * 💡 Поддерживает:
+ * - работу с несколькими RPC-эндпоинтами
+ * - лимитирование запросов (HTTP и WebSocket)
+ * - автоматическое восстановление соединений
+ * - интеграцию с подписками и логированием
+ */
+
+import { Connection } from '@solana/web3.js';
 import { sharedLogger } from '../../../utils/sharedLogger.js';
+import { getCurrentConfig } from '../config/configLoader.js';
+import { sendSubscriptionStateUpdate } from '../utils/subscriptionStatePublisher.js';
 import { resubscribeAll } from '../subscription/subscriptionManager.js';
-import {
-  initRpcPool as coreInitRpcPool,
-  getAllRpcClients,
-  getAvailableRpc,
-  getWsConnections,
-  closeRpcPool,
-} from './rpcPoolCore.js';
-
-import { handleDisconnect } from './handleDisconnect.js'; // ✅ подключаем вынесенную логику
-
-let reconnectInProgress = false;
-
-export async function initRpcPool(endpoints) {
-  await coreInitRpcPool(endpoints, connectionFactory);
-
-  for (const rpc of getAllRpcClients()) {
-    const ws = rpc.wsConn._rpcWebSocket;
-    if (ws) {
-      ws.on('close', () => handleDisconnect(rpc.id));
-      ws.on('error', () => handleDisconnect(rpc.id));
-    }
-  }
-
-  console.log(`🌐 Инициализировано ${getAllRpcClients().length} RPC`);
-}
-
-export function __setReconnectInProgress(val) {
-  reconnectInProgress = val;
-}
-
-export {
-  getAllRpcClients,
-  getWsConnections,
-  getAvailableRpc,
-  closeRpcPool,
-};
-
-
-/services/solana_subscriber/rpc/rpcPoolCore.js:
 import { createLimiter } from './rpcLimiter.js';
-import { sharedLogger } from '../../../utils/sharedLogger.js';
 
+const rpcPool = []; // 🧠 массив активных RPC клиентов
+let reconnectInProgress = false; // 🔐 флаг защиты от повторного reconnect
 
-const rpcPool = [];
-
-export function getAllRpcClients() {
-  return rpcPool;
+/**
+ * ⚙️ Создаёт RPC-соединение с HTTP и (опционально) WebSocket
+ * 
+ * @param {string} httpUrl - URL HTTP RPC (обязательно)
+ * @param {string|null} wsUrl - URL WebSocket RPC (если есть)
+ * @returns {Connection}
+ */
+function connectionFactory(httpUrl, wsUrl = null) {
+  return new Connection(httpUrl, {
+    commitment: 'confirmed',
+    ...(wsUrl ? { wsEndpoint: wsUrl } : {}), // поддержка WS если задан
+  });
 }
 
-export function getWsConnections() {
-  return rpcPool.map((r) => r.wsConn);
-}
+/**
+ * 🔁 Инициализация пула RPC клиентов.
+ * Используется при старте или пересоздании после сбоя.
+ * 
+ * @param {Array} endpoints - список RPC-объектов из subscriber_config
+ */
+export async function initRpcPool(endpoints) {
+  rpcPool.length = 0; // очищаем старый пул
 
-export async function initRpcPool(endpoints, connectionFactory) {
-  rpcPool.length = 0;
+  const {
+    http_limit_per_sec = 10,
+    ws_limit_per_sec = 5,
+  } = getCurrentConfig(); // лимиты из базы
 
   for (let i = 0; i < endpoints.length; i++) {
     const endpoint = endpoints[i];
     const rpcId = `rpc-${i + 1}`;
 
-    const limiter = createLimiter(endpoint.rate_limits?.max_requests_per_sec || 10);
+    // 🧰 лимитеры для защиты от rate limit
+    const httpLimiter = createLimiter(http_limit_per_sec);
+    const wsLimiter = createLimiter(ws_limit_per_sec);
+
+    // 🌐 создаём соединения
     const httpConn = connectionFactory(endpoint.http);
     const wsConn = connectionFactory(endpoint.http, endpoint.ws);
 
@@ -882,66 +1565,171 @@ export async function initRpcPool(endpoints, connectionFactory) {
       id: rpcId,
       httpConn,
       wsConn,
-      limiter,
+      httpLimiter,
+      wsLimiter,
     });
 
-    // return ws to upper level to attach listeners
+    // 📡 обрабатываем события отключения WS
     const ws = wsConn._rpcWebSocket;
     if (ws) {
-      ws.rpcId = rpcId; // allow upper layer to track
+      ws.rpcId = rpcId;
+      ws.on('close', () => handleDisconnect(rpcId));
+      ws.on('error', () => handleDisconnect(rpcId));
     }
   }
 }
 
+/**
+ * 🎲 Возвращает доступный RPC клиент.
+ * Сейчас — случайный. При одном RPC — всегда он.
+ */
+export function getAvailableRpc() {
+  if (!rpcPool.length) return null;
+  return rpcPool[Math.floor(Math.random() * rpcPool.length)];
+}
+
+/**
+ * 📋 Возвращает все RPC клиенты (для мониторинга или диагностики)
+ */
+export function getAllRpcClients() {
+  return rpcPool;
+}
+
+/**
+ * 📡 Возвращает все WebSocket соединения (для подписок)
+ */
+export function getWsConnections() {
+  return rpcPool.map(rpc => rpc.wsConn);
+}
+
+/**
+ * 🧹 Закрывает все RPC соединения и очищает пул.
+ * Используется при reconnect или завершении работы.
+ */
 export async function closeRpcPool() {
   for (const rpc of rpcPool) {
+    rpc.httpLimiter?.stop?.();
+    rpc.wsLimiter?.stop?.();
+
     try {
-      rpc.wsConn._rpcWebSocket?.close();
-    } catch (err) {
-      await sharedLogger({
-        service: 'solana_subscriber',
-        level: 'warn',
-        message: {
-          type: 'ws_close_failed',
-          rpc_id: rpc.id,
-          error: err.message,
-        },
-      });
-    }
+      await rpc.wsConn._rpcWebSocket?.close(); // закрываем WS
+    } catch (_) {}
   }
+  rpcPool.length = 0;
 }
 
-export async function getAvailableRpc() {
-  for (const rpc of rpcPool) {
-    if (rpc.limiter.removeToken()) {
-      return rpc;
-    }
+/**
+ * ♻️ Обрабатывает отключение WebSocket соединения.
+ * 🔐 Защищает от повторных вызовов через reconnectInProgress.
+ * 
+ * - Закрывает все соединения
+ * - Пересоздаёт пул
+ * - Восстанавливает подписки
+ */
+export async function handleDisconnect(rpcId) {
+  if (reconnectInProgress) {
+    try {
+      await sharedLogger({
+        service: getCurrentConfig().service_name,
+        level: 'warn',
+        message: {
+          type: 'duplicate_disconnect_skipped',
+          rpc_id: rpcId,
+        },
+      });
+    } catch (_) {}
+    return;
   }
-  return null;
+
+  reconnectInProgress = true;
+
+  try {
+    // ⚠️ логируем отключение
+    await sharedLogger({
+      service: getCurrentConfig().service_name,
+      level: 'warn',
+      message: {
+        type: 'ws_disconnect',
+        rpc_id: rpcId,
+      },
+    });
+
+    // 🧹 закрываем все RPC
+    await closeRpcPool();
+
+    // 🔁 пересоздаём из актуального конфига
+    const { rpc_endpoints } = getCurrentConfig();
+    await initRpcPool(rpc_endpoints);
+
+    // ♻️ пересоздаём подписки
+    await resubscribeAll();
+
+    await sharedLogger({
+      service: getCurrentConfig().service_name,
+      level: 'info',
+      message: {
+        type: 'reconnect',
+        rpc_id: rpcId,
+      },
+    });
+
+  } catch (err) {
+    await sharedLogger({
+      service: getCurrentConfig().service_name,
+      level: 'error',
+      message: {
+        type: 'reconnect_failed',
+        rpc_id: rpcId,
+        error: err.message,
+      },
+    });
+  } finally {
+    reconnectInProgress = false;
+  }
 }
 
 
 /services/solana_subscriber/rpc/rpcUtils.js:
+// services/solana_subscriber/rpc/rpcUtils.js
+
+// ✅ ГОТОВ
+
+/**
+ * 📦 Утилиты для безопасной работы с Solana RPC через web3.js
+ *
+ * 💡 Возможности:
+ * - ограничение по времени (таймаут)
+ * - логгирование RPC ошибок (с указанием метода и rpc_id)
+ * - поддержка кастомного `commitment` (только в getParsedTransaction)
+ */
+
 import { getCurrentConfig } from '../config/configLoader.js';
 import { sharedLogger } from '../../../utils/sharedLogger.js';
 import { withAbortTimeout } from '../../../utils/withAbortTimeout.js';
 
-const SERVICE_NAME = 'solana_subscriber';
-
+/**
+ * 🔍 Получает `ParsedTransaction` по сигнатуре с таймаутом и логгированием.
+ *
+ * @param {object} rpc - объект RPC из пула (httpConn, id и т.д.)
+ * @param {string} signature - сигнатура транзакции (txid)
+ * @returns {Promise<ParsedTransaction | null>}
+ */
 export async function getParsedTransactionWithTimeout(rpc, signature) {
-  const timeoutMs = getCurrentConfig().rpc_timeout_ms || 5000;
+  const config = getCurrentConfig();
+  const timeoutMs = config.rpc_timeout_ms || 5000;
+  const commitment = config.commitment || 'confirmed';
 
   try {
     return await withAbortTimeout(async (_signal) => {
       return await rpc.httpConn.getParsedTransaction(signature, {
-        commitment: 'confirmed',
+        commitment,
         maxSupportedTransactionVersion: 0,
       });
     }, timeoutMs);
   } catch (err) {
     try {
       await sharedLogger({
-        service: SERVICE_NAME,
+        service: config.service_name,
         level: 'warn',
         message: {
           type: 'rpc_timeout',
@@ -956,8 +1744,17 @@ export async function getParsedTransactionWithTimeout(rpc, signature) {
   }
 }
 
+/**
+ * 📜 Получает список сигнатур для заданного адреса аккаунта (с таймаутом).
+ *
+ * @param {object} rpc - RPC-клиент из пула
+ * @param {string | PublicKey} address - адрес аккаунта
+ * @param {object} options - параметры запроса: { limit, before, until }
+ * @returns {Promise<Array<ConfirmedSignatureInfo> | null>}
+ */
 export async function getSignaturesForAddressWithTimeout(rpc, address, options = {}) {
-  const timeoutMs = getCurrentConfig().rpc_timeout_ms || 5000;
+  const config = getCurrentConfig();
+  const timeoutMs = config.rpc_timeout_ms || 5000;
 
   try {
     return await withAbortTimeout(async (_signal) => {
@@ -966,7 +1763,7 @@ export async function getSignaturesForAddressWithTimeout(rpc, address, options =
   } catch (err) {
     try {
       await sharedLogger({
-        service: SERVICE_NAME,
+        service: config.service_name,
         level: 'warn',
         message: {
           type: 'rpc_timeout',
@@ -983,63 +1780,111 @@ export async function getSignaturesForAddressWithTimeout(rpc, address, options =
 
 
 /services/solana_subscriber/start.js:
+// services/solana_subscriber/start.js
+
+// 📦 Подключение модулей БД
 import { initPostgres, closePostgres } from './db/db.js';
-import { loadSubscriberConfig } from './config/configLoader.js';
+
+// 📥 Загрузка конфигурации
+import { loadSubscriberConfig, getCurrentConfig } from './config/configLoader.js';
+
+// 🔌 RPC
 import { initRpcPool, closeRpcPool } from './rpc/rpcPool.js';
-import { getActiveSubscriptions } from './db/subscriptions.js';
+
+// 📡 Подписки
 import {
   startAllSubscriptions,
   stopAllSubscriptions,
 } from './subscription/subscriptionManager.js';
-import {
-  startOnLogsQueueWorker,
-  stopOnLogsQueueWorker,
-} from './queue/onLogsQueueWorker.js';
-import {
-  startRedisRetryWorker,
-  stopRedisRetryWorker,
-} from './queue/redisRetryQueue.js';
+
+// 🧾 Получение подписок из БД
+import { getActiveSubscriptions } from './db/subscriptions.js';
+
+// 🔄 Очереди
+import { startParseQueueWorker } from './queue/parseQueue.js';
+import { startPublishQueueWorker } from './queue/publishQueue.js';
+import { startSignatureUpdateWorker } from './queue/signatureUpdateBuffer.js';
+
+// 📬 Redis consumer (команды)
 import {
   startRedisConsumer,
   stopRedisConsumer,
 } from './config/redisConsumer.js';
+
+// ❤️ Heartbeat в Redis
+import { startHeartbeat, stopHeartbeat } from '../../utils/heartbeat.js';
+
+// 🔌 Redis client (singleton)
+import { getRedisClient, disconnectRedisClient } from '../../utils/redisClientSingleton.js';
+
+// 📢 Логирование
 import { sharedLogger } from '../../utils/sharedLogger.js';
 
+// 🧠 Новый шаг — верификатор подписок (каждые N мс сверяет WS-подписки)
+import { startWsSubscriptionVerifier, stopWsSubscriptionVerifier } from './subscription/wsSubscriptionVerifier.js';
+
+// 🔐 Флаг корректного завершения
 let shuttingDown = false;
 
+/**
+ * 🚀 Запуск микросервиса `solana_subscriber`
+ */
 export async function start() {
   try {
-    // ⛑️ Оборачиваем первый sharedLogger и прерываем запуск при ошибке
+    // 1️⃣ Загрузка конфигурации (в первую очередь!)
     try {
+      await loadSubscriberConfig(); // нужно для getCurrentConfig()
       await sharedLogger({
-        service: 'solana_subscriber',
+        service: getCurrentConfig().service_name,
         level: 'info',
         message: '⚙ Инициализация микросервиса...',
       });
     } catch (err) {
-      console.warn('❌ sharedLogger init failed:', err.message);
+      // Если sharedLogger сам не сработал — fallback лог
+      try {
+        await sharedLogger({
+          service: 'solana_subscriber',
+          level: 'error',
+          message: {
+            type: 'shared_logger_init_failed',
+            error: err.message,
+          },
+        });
+      } catch (_) {}
       process.exit(1);
       return;
     }
 
-    await initPostgres();
+    // 2️⃣ Инфраструктура
+    await getRedisClient();      // Redis
+    await initPostgres();        // PostgreSQL
 
-    const config = await loadSubscriberConfig();
+    // 3️⃣ RPC
+    const config = getCurrentConfig();
     await initRpcPool(config.rpc_endpoints);
 
+    // 4️⃣ Подписки из базы
     const subscriptions = await getActiveSubscriptions();
-
     if (subscriptions?.length) {
       await startAllSubscriptions(subscriptions);
     }
 
-    startRedisConsumer();
-    startOnLogsQueueWorker();
-    startRedisRetryWorker();
+    // 5️⃣ Очереди + воркеры
+    await startRedisConsumer();       // Подписка на команды
+    startParseQueueWorker();          // Обработка сигнатур
+    startPublishQueueWorker();        // Публикация транзакций
+    startSignatureUpdateWorker();     // Повторные попытки updateLastSignature
 
+    // 6️⃣ ❤️ Heartbeat в Redis
+    await startHeartbeat(config.service_name);
+
+    // 7️⃣ 🧠 Верификатор WebSocket-подписок (новый шаг)
+    startWsSubscriptionVerifier();
+
+    // ✅ Успешный запуск
     try {
       await sharedLogger({
-        service: 'solana_subscriber',
+        service: config.service_name,
         level: 'info',
         message: '🚀 solana_subscriber успешно запущен',
       });
@@ -1047,31 +1892,37 @@ export async function start() {
   } catch (err) {
     try {
       await sharedLogger({
-        service: 'solana_subscriber',
+        service: getCurrentConfig().service_name,
         level: 'error',
-        message: `Ошибка при инициализации: ${err.message}`,
+        message: {
+          type: 'startup_failed',
+          error: err.message,
+        },
       });
     } catch (_) {}
-
     process.exit(1);
   }
 }
 
+/**
+ * 🛑 Корректное завершение работы сервиса
+ */
 export async function shutdown() {
   if (shuttingDown) return;
   shuttingDown = true;
 
   try {
     await stopRedisConsumer();
-    await stopOnLogsQueueWorker();
-    await stopRedisRetryWorker();
     await stopAllSubscriptions();
     await closeRpcPool();
     await closePostgres();
+    await stopHeartbeat();
+    stopWsSubscriptionVerifier();       // 🧠 Остановка проверки подписок
+    await disconnectRedisClient();      // Redis shutdown
 
     try {
       await sharedLogger({
-        service: 'solana_subscriber',
+        service: getCurrentConfig().service_name,
         level: 'info',
         message: '✅ Завершено корректно',
       });
@@ -1081,9 +1932,12 @@ export async function shutdown() {
   } catch (err) {
     try {
       await sharedLogger({
-        service: 'solana_subscriber',
+        service: getCurrentConfig().service_name,
         level: 'error',
-        message: `❌ Ошибка при завершении: ${err.message}`,
+        message: {
+          type: 'shutdown_failed',
+          error: err.message,
+        },
       });
     } catch (_) {}
 
@@ -1092,138 +1946,208 @@ export async function shutdown() {
 }
 
 
-/services/solana_subscriber/subscription/onLogsHandler.js:
-import { getParsedTransactionWithTimeout } from '@/services/solana_subscriber/rpc/rpcUtils.js';
-import { scheduleRetry } from '@/services/solana_subscriber/queue/retryQueue.js';
-import { enqueueSignature } from '@/services/solana_subscriber/queue/onLogsQueue.js';
-import { sharedLogger } from '@/utils/sharedLogger.js';
-import { getCurrentConfig } from '@/services/solana_subscriber/config/configLoader.js';
-import { redisPublishLog } from '@/services/solana_subscriber/utils/redisLogSender.js';
-import { updateLastSignature } from '@/services/solana_subscriber/db/subscriptions.js';
-import { enqueueRedisRetry } from '@/services/solana_subscriber/queue/redisRetryQueue.js';
+/services/solana_subscriber/subscription/maybeTriggerRecovery.js:
+// services/solana_subscriber/subscription/maybeTriggerRecovery.js
 
-const SERVICE_NAME = 'solana_subscriber';
+// ✅ ОБНОВЛЁН: добавлена TTL для rateLimitedRpcIds
 
-export async function handleLogEvent({ chain_id, account, signature, subscription_type, rpc }) {
-  try {
-    const config = getCurrentConfig();
+/**
+ * Этот модуль отвечает за запуск восстановления транзакций (recoverTransactions)
+ * для всех аккаунтов, подписанных через конкретный WebSocket RPC, в случае превышения лимита (rate limit).
+ *
+ * Почему это важно:
+ * При rate limit-е Solana WebSocket может "потерять" сигнатуры для подписанных аккаунтов.
+ * Чтобы не упустить эти транзакции, мы запускаем восстановление по всем аккаунтам, использующим тот же RPC.
+ */
 
-    const allowedTypes = new Set(['regular', 'control', 'mint', 'share', 'spl_token']);
-    if (!allowedTypes.has(subscription_type)) {
-      try {
-        await sharedLogger({
-          service: SERVICE_NAME,
-          level: 'warn',
-          message: {
-            type: 'unsupported_subscription_type',
-            subscription_type,
-            signature,
-            chain_id,
-            account,
-          },
-        });
-      } catch (_) {}
-      return;
-    }
+import { recoverTransactions } from './recoveryManager.js';
+import { sharedLogger } from '../../../utils/sharedLogger.js';
+import { getCurrentConfig } from '../config/configLoader.js';
 
-    if (!rpc.limiter.removeToken()) {
-      enqueueSignature(signature);
-      try {
-        await sharedLogger({
-          service: SERVICE_NAME,
-          level: 'warn',
-          message: {
-            event: 'rate_limit',
-            signature,
-            rpc_id: rpc.id,
-            chain_id,
-            account,
-          },
-        });
-      } catch (_) {}
-      return;
-    }
+/**
+ * @typedef {Object} Subscription
+ * @property {string} chain_id - Название цепочки, к которой принадлежит подписка.
+ * @property {string} account - Адрес Solana-аккаунта, на который подписались.
+ * @property {string} rpc_id - ID RPC-клиента, через который была установлена подписка.
+ */
 
-    const parsed = await getParsedTransactionWithTimeout(rpc, signature);
-    if (!parsed) {
-      await scheduleRetry(signature);
-      return;
-    }
+/**
+ * Хранилище RPC ID, на которых уже был зафиксирован rate limit, с TTL (время жизни).
+ * Мы используем Map, чтобы в будущем можно было анализировать метку времени или добавить счётчики.
+ */
+const rateLimitedRpcIds = new Map();
 
-    if (parsed.meta?.err) {
-      try {
-        await sharedLogger({
-          service: SERVICE_NAME,
-          level: 'warn',
-          message: {
-            type: 'failed_transaction',
-            signature,
-            error: parsed.meta.err,
-          },
-        });
-      } catch (_) {}
-      return;
-    }
+/**
+ * Функция для обработки ситуации, когда на RPC был превышен лимит WebSocket-запросов.
+ *
+ * @param {string} rpc_id - ID RPC клиента, где сработал лимит
+ * @param {Map<string, Subscription>} activeSubscriptions - Список всех активных подписок
+ */
+export function maybeTriggerRecovery(rpc_id, activeSubscriptions) {
+  const config = getCurrentConfig();
 
-    const blockTime = parsed.blockTime || null;
-    const timestamp = blockTime ? blockTime * 1000 : Date.now();
+  const cooldownMs = config.recovery_cooldown_ms || 60000; // 🔁 TTL (по умолчанию 1 минута)
+  const recoveryAgeMs = config.recovery_max_age_ms || 300000; // 🕒 восстановление за последние 5 минут
 
-    const message = {
-      chain_id,
-      account,
-      signature,
-      log: parsed,
-      subscription_type,
-      blockTime,
-      timestamp,
-    };
+  // 🧠 Уже триггерили на этот RPC — выходим
+  if (rateLimitedRpcIds.has(rpc_id)) return;
 
-    const streamKey =
-      subscription_type === 'spl_token'
-        ? 'solana_logs_spl'
-        : 'solana_logs_regular';
+  // ✅ Добавляем в Map с временной меткой
+  rateLimitedRpcIds.set(rpc_id, Date.now());
+
+  // ⏲️ Планируем удаление из Map через cooldown
+  setTimeout(() => {
+    rateLimitedRpcIds.delete(rpc_id);
+  }, cooldownMs);
+
+  // 🔁 Перебираем все активные подписки, ищем те, что связаны с этим RPC
+  for (const sub of activeSubscriptions.values()) {
+    if (sub.rpc_id !== rpc_id) continue;
+
+    const { chain_id, account } = sub;
 
     try {
-      await redisPublishLog(streamKey, message);
-      await updateLastSignature(chain_id, account, signature);
+      sharedLogger({
+        service: config.service_name,
+        level: 'info',
+        message: {
+          type: 'recovery_triggered_due_to_rate_limit',
+          chain_id,
+          account,
+          rpc_id,
+        },
+      });
+    } catch (_) {}
 
+    recoverTransactions({
+      chain_id,
+      account,
+      last_signature: null,
+      history_max_age_ms: recoveryAgeMs,
+    }).catch(async (err) => {
       try {
         await sharedLogger({
-          service: SERVICE_NAME,
-          level: 'info',
-          message: {
-            type: 'transaction_dispatched',
-            stream: streamKey,
-            signature,
-            chain_id,
-            rpc_id: rpc.id,
-          },
-        });
-      } catch (_) {}
-    } catch (err) {
-      enqueueRedisRetry({ streamKey, message });
-
-      try {
-        await sharedLogger({
-          service: SERVICE_NAME,
+          service: config.service_name,
           level: 'error',
           message: {
-            type: 'redis_publish_failed',
-            signature,
+            type: 'recovery_failed_after_rate_limit',
+            chain_id,
+            account,
+            rpc_id,
             error: err.message,
           },
         });
       } catch (_) {}
+    });
+  }
+}
+
+
+/services/solana_subscriber/subscription/onLogsHandler.js:
+// services/solana_subscriber/subscription/onLogsHandler.js
+
+// ✅ ГОТОВ (обновлён с проверкой сигнатуры)
+
+/**
+ * Этот модуль обрабатывает события логов (onLogs), приходящие по WebSocket
+ * от подписанных аккаунтов Solana.
+ *
+ * Каждое событие может содержать сигнатуру транзакции. Цель модуля — определить:
+ * - нужно ли реагировать на событие
+ * - в какую очередь поместить сигнатуру
+ * - что делать при превышении лимита WebSocket RPC (rate limit)
+ *
+ * Дальнейшая обработка транзакции (парсинг, публикация и т.д.) происходит в других модулях.
+ */
+
+import { enqueueSignature } from '../queue/parseQueue.js';
+import { enqueueToPerAccountPublishQueue, isPrioritized } from '../queue/perAccountPublishQueueManager.js';
+import { sharedLogger } from '../../../utils/sharedLogger.js';
+import { maybeTriggerRecovery } from './maybeTriggerRecovery.js';
+import { getCurrentConfig } from '../config/configLoader.js';
+
+/**
+ * Обработка одного события логов (WebSocket).
+ *
+ * @param {Object} params - Входные параметры
+ * @param {string} params.chain_id - Название цепочки, к которой относится аккаунт
+ * @param {string} params.account - Адрес аккаунта, по которому пришли логи
+ * @param {string} params.signature - Сигнатура транзакции (txid)
+ * @param {Object} params.rpc - Объект RPC-клиента, через который пришло событие
+ *
+ * Поведение:
+ * - если сигнатура отсутствует — игнорируем
+ * - если лимит WebSocket превышен — логируем, запускаем восстановление через maybeTriggerRecovery
+ * - создаём задачу и помещаем в нужную очередь:
+ *    - приоритетную (если isPrioritized)
+ *    - обычную очередь для парсинга
+ * - любые ошибки логируются, чтобы не упал WebSocket обработчик
+ */
+export async function handleLogEvent({ chain_id, account, signature, rpc }) {
+  try {
+    /**
+     * ✅ Проверяем валидность сигнатуры:
+     * - должна быть строкой
+     * - должна быть длиной минимум 80 символов (эвристика)
+     */
+    if (typeof signature !== 'string' || signature.length < 80) return;
+
+    // Формируем задачу для последующей обработки
+    const task = {
+      chain_id,
+      account,
+      signature,
+      enqueuedAt: Date.now(),
+    };
+
+    /**
+     * Проверяем лимит WebSocket-запросов (rate limit).
+     * Если лимит превышен — не теряем событие, а инициируем восстановление всех подписок на этом RPC.
+     */
+    if (!rpc.wsLimiter.removeToken()) {
+      try {
+        await sharedLogger({
+          service: getCurrentConfig().service_name,
+          level: 'warn',
+          message: {
+            type: 'ws_rate_limited',
+            signature,
+            chain_id,
+            account,
+            rpc_id: rpc.id,
+          },
+        });
+      } catch (_) {}
+
+      maybeTriggerRecovery(rpc.id);
+      return;
     }
+
+    /**
+     * В зависимости от приоритета аккаунта, помещаем задачу
+     * в соответствующую очередь:
+     * - perAccountQueue → индивидуальный воркер с высоким приоритетом
+     * - parseQueue → общая очередь для стандартной обработки
+     */
+    if (isPrioritized(chain_id, account)) {
+      enqueueToPerAccountPublishQueue(task);
+    } else {
+      enqueueSignature(task);
+    }
+
   } catch (err) {
-    await scheduleRetry(signature);
+    /**
+     * Логируем ошибку, чтобы не прервать поток обработки событий
+     */
     try {
       await sharedLogger({
-        service: SERVICE_NAME,
+        service: getCurrentConfig().service_name,
         level: 'error',
         message: {
-          type: 'log_event_exception',
+          type: 'handle_log_event_failed',
           signature,
+          chain_id,
+          account,
           error: err.message,
         },
       });
@@ -1233,21 +2157,57 @@ export async function handleLogEvent({ chain_id, account, signature, subscriptio
 
 
 /services/solana_subscriber/subscription/recoveryManager.js:
-import { getSignaturesForAddressWithTimeout, getParsedTransactionWithTimeout } from '../rpc/rpcUtils.js';
-import { getAvailableRpc } from '../rpc/rpcPool.js'; // ✅ Правильный импорт
-import { redisPublishLog } from '../utils/redisLogSender.js';
+// services/solana_subscriber/subscription/recoveryManager.js
+
+// ✅ ГОТОВ
+
+/**
+ * Модуль восстановления транзакций (по сигнатурам) для Solana-аккаунтов.
+ *
+ * Используется при:
+ * - старте подписки (`subscribeToAccount`)
+ * - сбое RPC или reconnect-е (`resubscribeAll`)
+ * - превышении лимита WebSocket (`maybeTriggerRecovery`)
+ *
+ * Восстановление происходит по следующим правилам:
+ * - мы запрашиваем сигнатуры через RPC методом `getSignaturesForAddress`
+ * - ограничиваем восстановление по времени (`maxAgeMs`) или по `last_signature`
+ * - загружаем сигнатуры постранично (limit = 1000), пока не получим всё
+ * - добавляем их в очередь на парсинг (`enqueueSignature` или `enqueueToPerAccountQueue`)
+ *
+ * Все сигнатуры сортируются в порядке **от старой к новой**, чтобы сохранить консистентность.
+ */
+
+import { getSignaturesForAddressWithTimeout } from '../rpc/rpcUtils.js';
+import { getAvailableRpc } from '../rpc/rpcPool.js';
 import { sharedLogger } from '../../../utils/sharedLogger.js';
-import { updateLastSignature } from '../db/subscriptions.js';
+import { enqueueSignature } from '../queue/parseQueue.js';
+import { enqueueToPerAccountPublishQueue, isPrioritized } from '../queue/perAccountPublishQueueManager.js';
+import { getCurrentConfig } from '../config/configLoader.js';
 
-const SERVICE_NAME = 'solana_subscriber';
-const MAX_BATCH = 1000;
 
-export async function recoverTransactions({ chain_id, account, last_signature, subscription_type }) {
+/**
+ * Восстанавливает транзакции (сигнатуры) по указанному аккаунту.
+ *
+ * @param {Object} params
+ * @param {string} params.chain_id - Название логической цепочки (chain1, chain2 и т.п.)
+ * @param {string} params.account - Адрес Solana-аккаунта (на который была подписка)
+ * @param {string|null} params.last_signature - Сигнатура, до которой (исключительно) нужно восстановить
+ *
+ * Поведение:
+ * - если last_signature = null → восстановление до максимального возраста (`maxAgeMs`)
+ * - если last_signature указана → восстановление идёт до неё, не включая её саму
+ */
+export async function recoverTransactions({ chain_id, account, last_signature }) {
+  /**
+   * Получаем доступный RPC-клиент для выполнения запроса.
+   * Если нет доступного — логируем предупреждение и выходим.
+   */
   const rpc = await getAvailableRpc();
   if (!rpc) {
     try {
       await sharedLogger({
-        service: SERVICE_NAME,
+        service: getCurrentConfig().service_name,
         level: 'warn',
         message: {
           type: 'recovery_skipped',
@@ -1260,9 +2220,12 @@ export async function recoverTransactions({ chain_id, account, last_signature, s
     return;
   }
 
+  /**
+   * Логируем начало восстановления
+   */
   try {
     await sharedLogger({
-      service: SERVICE_NAME,
+      service: getCurrentConfig().service_name,
       level: 'info',
       message: {
         type: 'recovery_started',
@@ -1274,13 +2237,22 @@ export async function recoverTransactions({ chain_id, account, last_signature, s
     });
   } catch (_) {}
 
+  // Конфигурация и инициализация
   const allSignatures = [];
+  const maxAgeMs = getCurrentConfig().default_history_max_age_ms || 86400000;
+  const now = Date.now();
+
   let before = undefined;
   let keepFetching = true;
 
+  /**
+   * 🔁 Основной цикл постраничной загрузки сигнатур
+   * Solana отдаёт сигнатуры от НОВЫХ к СТАРЫМ (обратный порядок),
+   * поэтому мы просто `push`, а в конце — `reverse()`.
+   */
   while (keepFetching) {
     const options = {
-      limit: MAX_BATCH,
+      limit: 1000,
       ...(before ? { before } : {}),
       ...(last_signature ? { until: last_signature } : {}),
     };
@@ -1288,73 +2260,67 @@ export async function recoverTransactions({ chain_id, account, last_signature, s
     const sigs = await getSignaturesForAddressWithTimeout(rpc, account, options);
     if (!sigs || sigs.length === 0) break;
 
+    // Фильтруем только подтверждённые
     const confirmed = sigs.filter(sig => sig.confirmationStatus === 'confirmed');
-    allSignatures.push(...confirmed);
 
-    if (sigs.length < MAX_BATCH) {
-      keepFetching = false;
-    } else {
-      before = sigs[sigs.length - 1].signature;
+    for (const sig of confirmed) {
+      // Если достигли заданной last_signature → останавливаемся
+      if (sig.signature === last_signature) {
+        keepFetching = false;
+        break;
+      }
+
+      // Если sig устарел по времени → тоже прекращаем
+      if (sig.blockTime && sig.blockTime * 1000 < now - maxAgeMs) {
+        keepFetching = false;
+        break;
+      }
+
+      allSignatures.push(sig);
     }
+
+    // Если вернулось меньше 1000 — это последняя страница
+    if (sigs.length < 1000) break;
+
+    // Переход к следующей странице (ещё более старые транзакции)
+    before = sigs[sigs.length - 1].signature;
   }
 
-  const ordered = allSignatures.sort((a, b) => a.slot - b.slot);
-  const messages = [];
+  /**
+   * Переворачиваем список — теперь от СТАРОЙ к НОВОЙ
+   */
+  allSignatures.reverse();
 
-  for (const sig of ordered) {
-    const parsed = await getParsedTransactionWithTimeout(rpc, sig.signature);
-    if (!parsed || parsed.meta?.err) continue;
-
-    const blockTime = parsed.blockTime || null;
-    const timestamp = blockTime ? blockTime * 1000 : Date.now();
-
-    messages.push({
+  /**
+   * Помещаем каждую сигнатуру в соответствующую очередь на обработку
+   */
+  for (const sig of allSignatures) {
+    const task = {
       chain_id,
       account,
       signature: sig.signature,
-      log: parsed,
-      subscription_type,
-      blockTime,
-      timestamp,
-    });
-  }
+      enqueuedAt: Date.now(),
+    };
 
-  const streamKey =
-    subscription_type === 'spl_token'
-      ? 'solana_logs_spl'
-      : 'solana_logs_regular';
-
-  for (const msg of messages) {
-    try {
-      await redisPublishLog(streamKey, msg);
-    } catch (err) {
-      await sharedLogger({
-        service: SERVICE_NAME,
-        level: 'error',
-        message: {
-          type: 'recovery_publish_failed',
-          signature: msg.signature,
-          error: err.message,
-        },
-      });
-      return; // ⛔ останавливаем, last_signature не обновляем
+    if (isPrioritized(chain_id, account)) {
+      enqueueToPerAccountPublishQueue(task);
+    } else {
+      enqueueSignature(task);
     }
   }
 
-  const lastProcessed = messages[messages.length - 1];
-  if (lastProcessed) {
-    await updateLastSignature(chain_id, account, lastProcessed.signature);
-  }
-
+  /**
+   * Логируем завершение восстановления
+   */
   try {
     await sharedLogger({
-      service: SERVICE_NAME,
+      service: getCurrentConfig().service_name,
       level: 'info',
       message: {
-        type: 'recovery_completed',
+        type: 'recovery_queued',
         chain_id,
         account,
-        recovered_count: messages.length,
+        count: allSignatures.length,
       },
     });
   } catch (_) {}
@@ -1362,102 +2328,231 @@ export async function recoverTransactions({ chain_id, account, last_signature, s
 
 
 /services/solana_subscriber/subscription/subscriptionManager.js:
-import { getAvailableRpc } from '../rpc/rpcPoolCore.js';
+// services/solana_subscriber/subscription/subscriptionManager.js
+
+// ✅ ГОТОВ
+
+/**
+ * 📡 Модуль управления подписками на аккаунты Solana.
+ *
+ * Выполняет:
+ * - запуск новых подписок
+ * - остановку подписок
+ * - восстановление истории
+ * - буферизацию логов, полученных до завершения восстановления
+ */
+
+import { getAvailableRpc } from '../rpc/rpcPool.js';
 import { sharedLogger } from '../../../utils/sharedLogger.js';
 import { handleLogEvent } from './onLogsHandler.js';
 import { recoverTransactions } from './recoveryManager.js';
-import { getLastSignatureForAccount } from '../db/subscriptions.js';
+
+import {
+  getLastSignatureForAccount,
+  upsertSubscription,
+  deactivateSubscription,
+} from '../db/subscriptions.js';
+
+import {
+  isPrioritized,
+  markAccountAsPrioritized,
+} from '../queue/perAccountPublishQueueManager.js';
+
+import { sendSubscriptionStateUpdate } from '../utils/subscriptionStatePublisher.js';
 import { getCurrentConfig } from '../config/configLoader.js';
 
-const SERVICE_NAME = 'solana_subscriber';
+// Активные подписки: key = `${chain_id}:${account}` → {...}
+const activeSubscriptions = new Map();
 
-const activeSubscriptions = new Map(); // key: `${chain_id}:${account}`
+// Флаги восстановления
+const recoveryInProgress = new Map();
 
-// 👇 глобальная переменная для тестов (можно подменять в тесте)
-globalThis.__mockedSubscribeToAccount = null;
+// Буфер логов, пришедших до восстановления
+const bufferedSignatures = new Map();
 
+/**
+ * 🔁 Старт всех подписок из БД
+ */
 export async function startAllSubscriptions(subscriptionList) {
   for (const sub of subscriptionList) {
-    await subscribeToAccount(sub);
+    await subscribeToAccount({
+      chain_id: sub.chain_id,
+      account: sub.account,
+      last_signature: sub.last_signature,
+      priority: sub.priority === true,
+    });
   }
 }
 
+/**
+ * ⛔ Завершение всех подписок
+ */
 export async function stopAllSubscriptions() {
   for (const key of activeSubscriptions.keys()) {
     await unsubscribeFromAccount(key);
   }
 }
 
-export async function subscribeToAccount({ chain_id, account, subscription_type, last_signature = null }) {
+/**
+ * 📥 Подписка на конкретный аккаунт
+ */
+export async function subscribeToAccount({
+  chain_id,
+  account,
+  last_signature = null,
+  history_max_age_ms,
+  priority = false,
+}) {
   const key = `${chain_id}:${account}`;
+
   if (activeSubscriptions.has(key)) return;
 
+  // Если приоритет — сразу активируем воркер
+  if (priority === true) {
+    markAccountAsPrioritized(chain_id, account);
+  }
+
+  const configHistoryMaxAge = getCurrentConfig().default_history_max_age_ms;
+  const effectiveHistoryAge = history_max_age_ms || configHistoryMaxAge;
+
+  // ⏺️ Запись в БД
+  try {
+    await upsertSubscription({
+      chain_id,
+      account,
+      last_signature,
+      history_max_age_ms: effectiveHistoryAge,
+      priority,
+    });
+  } catch (err) {
+    await sharedLogger({
+      service: getCurrentConfig().service_name,
+      level: 'error',
+      message: {
+        type: 'upsert_subscription_failed',
+        chain_id,
+        account,
+        error: err.message,
+      },
+    });
+    return;
+  }
+
+  // 🌐 RPC WebSocket
   const rpc = await getAvailableRpc();
   if (!rpc) {
     await sharedLogger({
-      service: SERVICE_NAME,
+      service: getCurrentConfig().service_name,
       level: 'warn',
       message: {
         type: 'subscribe_skipped',
         reason: 'no_available_rpc',
         chain_id,
         account,
-        subscription_type,
       },
     });
     return;
   }
 
-  // 🔁 если нет last_signature от команды — берём из БД
+  // 🧾 Последняя сигнатура
   if (!last_signature) {
     last_signature = await getLastSignatureForAccount(chain_id, account);
   }
 
-  // ✅ запуск восстановления
-  if (last_signature || subscription_type === 'regular') {
-    await recoverTransactions({
-      chain_id,
-      account,
-      last_signature,
-      subscription_type,
-    });
-  }
+  recoveryInProgress.set(key, true);
+  bufferedSignatures.set(key, []);
 
-  // ▶️ подписка onLogs
+  // 🔔 Подписка на логи
   const id = rpc.wsConn.onLogs(account, async (logInfo) => {
-    if (!logInfo?.signature || logInfo.err) return;
+    if (!logInfo?.signature) return;
+    const signature = logInfo.signature;
 
-    await handleLogEvent({
-      chain_id,
-      account,
-      signature: logInfo.signature,
-      subscription_type,
-      rpc,
-    });
+    if (recoveryInProgress.has(key)) {
+      bufferedSignatures.get(key).push(signature);
+    } else {
+      await handleLogEvent({ chain_id, account, signature, rpc });
+    }
   });
 
+  // 💾 Регистрируем подписку
   activeSubscriptions.set(key, {
     chain_id,
     account,
     rpc_id: rpc.id,
-    subscription_type,
     subscriptionId: id,
     wsConn: rpc.wsConn,
+    last_signature,
+    history_max_age_ms: effectiveHistoryAge,
   });
 
+  // 📢 Лог
   await sharedLogger({
-    service: SERVICE_NAME,
+    service: getCurrentConfig().service_name,
     level: 'info',
     message: {
       type: 'subscribe',
       chain_id,
       account,
-      subscription_type,
       rpc_id: rpc.id,
+      priority,
+    },
+  });
+
+  // 📡 Redis
+  try {
+    await sendSubscriptionStateUpdate({
+      chain_id,
+      account,
+      active: true,
+      connected: true,
+    });
+  } catch (_) {}
+
+  // ⏮️ Восстановление
+  try {
+    await recoverTransactions({
+      chain_id,
+      account,
+      last_signature,
+      history_max_age_ms: effectiveHistoryAge,
+    });
+  } catch (err) {
+    await sharedLogger({
+      service: getCurrentConfig().service_name,
+      level: 'error',
+      message: {
+        type: 'recovery_failed',
+        chain_id,
+        account,
+        error: err.message,
+      },
+    });
+  }
+
+  // 📦 Обработка буфера
+  const buffer = bufferedSignatures.get(key) || [];
+  for (const signature of buffer) {
+    await handleLogEvent({ chain_id, account, signature, rpc });
+  }
+
+  recoveryInProgress.delete(key);
+  bufferedSignatures.delete(key);
+
+  await sharedLogger({
+    service: getCurrentConfig().service_name,
+    level: 'info',
+    message: {
+      type: 'recovery_finished',
+      chain_id,
+      account,
+      buffered_signatures: buffer.length,
     },
   });
 }
 
+/**
+ * ❌ Отписка от аккаунта
+ */
 export async function unsubscribeFromAccount(key) {
   const sub = activeSubscriptions.get(key);
   if (!sub) return;
@@ -1466,7 +2561,7 @@ export async function unsubscribeFromAccount(key) {
     await sub.wsConn.removeOnLogsListener(sub.subscriptionId);
   } catch (err) {
     await sharedLogger({
-      service: SERVICE_NAME,
+      service: getCurrentConfig().service_name,
       level: 'warn',
       message: {
         type: 'unsubscribe_failed',
@@ -1479,67 +2574,277 @@ export async function unsubscribeFromAccount(key) {
   activeSubscriptions.delete(key);
 
   const [chain_id, account] = key.split(':');
+  await deactivateSubscription({ chain_id, account });
+
   await sharedLogger({
-    service: SERVICE_NAME,
+    service: getCurrentConfig().service_name,
     level: 'info',
     message: {
       type: 'unsubscribe',
       chain_id,
       account,
-      subscription_type: sub.subscription_type,
       rpc_id: sub.rpc_id,
     },
   });
+
+  try {
+    await sendSubscriptionStateUpdate({
+      chain_id,
+      account,
+      active: false,
+      connected: false,
+    });
+  } catch (_) {}
 }
 
+/**
+ * ♻️ Повторная подписка на все аккаунты
+ */
 export async function resubscribeAll() {
-  const oldSubs = Array.from(activeSubscriptions.values());
-  await stopAllSubscriptions();
-  for (const sub of oldSubs) {
-    await (globalThis.__mockedSubscribeToAccount || subscribeToAccount)({
-      chain_id: sub.chain_id,
-      account: sub.account,
-      subscription_type: sub.subscription_type,
-    });
+  const oldSubs = Array.from(activeSubscriptions.entries());
 
-    await sharedLogger({
-      service: SERVICE_NAME,
-      level: 'info',
-      message: {
-        type: 'resubscribe',
-        chain_id: sub.chain_id,
-        account: sub.account,
-        subscription_type: sub.subscription_type,
-      },
-    });
+  await stopAllSubscriptions();
+  await publishAllDisconnected();
+
+  for (const [key, sub] of oldSubs) {
+    const { chain_id, account, last_signature } = sub;
+
+    try {
+      await subscribeToAccount({
+        chain_id,
+        account,
+        last_signature,
+        priority: sub.priority === true,
+      });
+
+      await sharedLogger({
+        service: getCurrentConfig().service_name,
+        level: 'info',
+        message: {
+          type: 'resubscribe',
+          chain_id,
+          account,
+        },
+      });
+    } catch (err) {
+      await sharedLogger({
+        service: getCurrentConfig().service_name,
+        level: 'error',
+        message: {
+          type: 'resubscribe_failed',
+          chain_id,
+          account,
+          error: err.message,
+        },
+      });
+    }
   }
 }
 
-// ⬇️ экспортируем Map для тестов
-export const __activeSubscriptions = activeSubscriptions;
+/**
+ * 🔄 Уведомление об отключении всех подписок
+ */
+export async function publishAllDisconnected() {
+  for (const key of activeSubscriptions.keys()) {
+    const [chain_id, account] = key.split(':');
+    try {
+      await sendSubscriptionStateUpdate({
+        chain_id,
+        account,
+        active: true,
+        connected: false,
+      });
+    } catch (_) {}
+  }
+}
 
 
-/services/solana_subscriber/utils/redisLogSender.js:
-import { createClient } from 'redis';
+/services/solana_subscriber/subscription/subscriptionVerifier.js:
+// services/solana_subscriber/subscription/subscriptionVerifier.js
 
-let redis;
-let isConnected = false;
+/**
+ * 🧪 Модуль верификации WebSocket-подписок.
+ *
+ * Проверяет, что все подписки из `activeSubscriptions` реально существуют
+ * во внутреннем объекте `_rpcWebSocket._subscriptions` в web3.js.
+ *
+ * Если какая-то подписка «отвалилась» (например, не дошёл event 'close'),
+ * то:
+ * - логирует предупреждение
+ * - пробует заново отписаться и подписаться
+ *
+ * 🔁 Верификация запускается с интервалом (по умолчанию — 60 секунд),
+ * задаётся в subscriber_config.subscription_verifier_interval_ms.
+ */
 
-export async function redisPublishLog(streamKey, messageObject) {
+import { getCurrentConfig } from '../config/configLoader.js';
+import { sharedLogger } from '../../../utils/sharedLogger.js';
+import {
+  activeSubscriptions,
+  unsubscribeFromAccount,
+  subscribeToAccount,
+} from './subscriptionManager.js';
+
+let verifierInterval = null;
+
+/**
+ * 🚀 Запуск периодической верификации подписок
+ */
+export function startSubscriptionVerifier() {
+  const interval = getCurrentConfig().subscription_verifier_interval_ms || 60000;
+
+  verifierInterval = setInterval(async () => {
+    for (const [key, sub] of activeSubscriptions.entries()) {
+      const { subscriptionId, wsConn, chain_id, account, rpc_id } = sub;
+
+      // 🧠 Проверка: подписка присутствует в ._subscriptions
+      const isStillSubscribed =
+        wsConn?._rpcWebSocket?._subscriptions?.has(subscriptionId);
+
+      if (!isStillSubscribed) {
+        // ⚠️ Подписка "отвалилась"
+        await sharedLogger({
+          service: getCurrentConfig().service_name,
+          level: 'warn',
+          message: {
+            type: 'subscription_missing_in_ws',
+            chain_id,
+            account,
+            subscriptionId,
+            rpc_id,
+          },
+        });
+
+        try {
+          // ❌ Отписываемся от текущей (если она осталась в системе)
+          await unsubscribeFromAccount(key);
+
+          // ♻️ Повторно подписываемся
+          await subscribeToAccount({
+            chain_id,
+            account,
+            last_signature: sub.last_signature,
+            priority: sub.priority,
+          });
+
+          // ✅ Успешное восстановление
+          await sharedLogger({
+            service: getCurrentConfig().service_name,
+            level: 'info',
+            message: {
+              type: 'subscription_recovered_after_ws_missing',
+              chain_id,
+              account,
+              rpc_id,
+            },
+          });
+        } catch (err) {
+          await sharedLogger({
+            service: getCurrentConfig().service_name,
+            level: 'error',
+            message: {
+              type: 'subscription_recovery_failed',
+              chain_id,
+              account,
+              rpc_id,
+              error: err.message,
+            },
+          });
+        }
+      }
+    }
+  }, interval);
+}
+
+/**
+ * 🛑 Остановка верификации
+ */
+export function stopSubscriptionVerifier() {
+  if (verifierInterval) {
+    clearInterval(verifierInterval);
+    verifierInterval = null;
+  }
+}
+
+
+/services/solana_subscriber/utils/subscriptionStatePublisher.js:
+// ✅ ОБНОВЛЁННЫЙ
+
+// 📦 Redis-клиент (singleton)
+import { getRedisClient } from '../../../utils/redisClientSingleton.js';
+
+// 🧠 Централизованный логгер
+import { sharedLogger } from '../../../utils/sharedLogger.js';
+
+// 📥 Загруженная конфигурация (в том числе stream_subscription_state)
+import { getCurrentConfig } from '../config/configLoader.js';
+
+/**
+ * 📡 Отправляет событие `SUBSCRIPTION_STATE_CHANGED` в Redis Stream.
+ *
+ * Используется для оповещения других микросервисов и UI:
+ * - когда подписка добавлена
+ * - когда подписка удалена
+ * - при пересоздании подписок (resubscribeAll)
+ *
+ * Поток указывается в `subscriber_config.stream_subscription_state`.
+ *
+ * @param {object} params
+ * @param {string} params.chain_id - логическая цепочка (например, 'chain1')
+ * @param {string} params.account - адрес Solana-аккаунта
+ * @param {boolean} params.active - является ли подписка активной в БД
+ * @param {boolean} params.connected - подключено ли WebSocket-соединение
+ */
+export async function sendSubscriptionStateUpdate({ chain_id, account, active, connected }) {
+  const service = getCurrentConfig().service_name;
+  const STREAM_KEY = getCurrentConfig().stream_subscription_state;
+
+  // 📦 Формируем сообщение
+  const message = {
+    type: 'SUBSCRIPTION_STATE_CHANGED',
+    chain_id,
+    account,
+    active,
+    connected,
+    timestamp: Date.now(),
+  };
+
+  // ✅ Минимальная валидация
+  if (typeof message !== 'object' || message === null) {
+    await sharedLogger({
+      service,
+      level: 'warn',
+      message: {
+        type: 'subscription_state_publish_skipped',
+        reason: 'invalid_message_object',
+        message,
+      },
+    });
+    return;
+  }
+
   try {
-    if (!redis) {
-      redis = createClient({ url: 'redis://redis:6379' });
-    }
+    const redis = await getRedisClient();
 
-    if (!isConnected) {
-      await redis.connect();
-      isConnected = true;
-    }
+    // 🚀 Публикуем сообщение в Redis Stream
+    await redis.xAdd(STREAM_KEY, '*', {
+      data: JSON.stringify(message),
+    });
 
-    const payload = JSON.stringify(messageObject);
-    await redis.xAdd(streamKey, '*', { data: payload });
   } catch (err) {
-    console.warn('[redisPublishLog] Redis error:', err.message);
+    // ❌ Redis недоступен или другая ошибка — логируем
+    try {
+      await sharedLogger({
+        service,
+        level: 'error',
+        message: {
+          type: 'publish_subscription_state_failed',
+          error: err.message,
+          account,
+          chain_id,
+        },
+      });
+    } catch (_) {}
   }
 }
 

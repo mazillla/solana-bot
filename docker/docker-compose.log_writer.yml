@@ -9,6 +9,8 @@ services:
       - ../logs:/app/logs
     networks:
       - bot_network
+    env_file:
+      - ../.env
 
 networks:
   bot_network:

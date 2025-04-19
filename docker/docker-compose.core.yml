@@ -9,6 +9,8 @@ services:
       - redis-data:/data
     networks:
       - bot_network
+    env_file:
+      - ../.env
 
   postgres:
     image: postgres:15
@@ -25,6 +27,8 @@ services:
       - "5432:5432"
     networks:
       - bot_network
+    env_file:
+      - ../.env
 
   pgadmin:
     image: dpage/pgadmin4
@@ -39,6 +43,8 @@ services:
       - postgres
     networks:
       - bot_network
+    env_file:
+      - ../.env
 
   opensearch:
     image: opensearchproject/opensearch:2.13.0
@@ -61,6 +67,8 @@ services:
       - "9600:9600"
     networks:
       - bot_network
+    env_file:
+      - ../.env
 
   grafana:
     image: grafana/grafana:latest
@@ -80,6 +88,8 @@ services:
       - ../services/grafana/dashboards:/etc/grafana/dashboards
     networks:
       - bot_network
+    env_file:
+      - ../.env
 
   fluent-bit:
     image: fluent/fluent-bit:3.0.4
@@ -95,6 +105,8 @@ services:
     command: ["/fluent-bit/bin/fluent-bit", "-c", "/fluent-bit/etc/fluent-bit.conf"]
     networks:
       - bot_network
+    env_file:
+      - ../.env
 
   redisinsight:
     image: redis/redisinsight:latest
@@ -108,6 +120,8 @@ services:
       - redisinsight-data:/data
     depends_on:
       - redis
+    env_file:
+      - ../.env
 
 
 networks:
